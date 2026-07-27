@@ -50,8 +50,11 @@ There are two load-bearing boundaries, one per path code can take.
 **Merge restriction** covers code that reaches the default branch through a
 merge. A GitHub ruleset (or branch protection) prevents the bot from merging
 to protected branches (the default branch plus any in `protected_branches`)
-regardless of review status, and the composite action refuses to start if the
-default branch isn't protected.
+regardless of review status. The composite action's preflight verifies this
+as the bot itself: `current_user_can_bypass` on each applying ruleset is
+GitHub's own evaluation of the bot's standing — teams, custom roles, and
+org-level rulesets included — and the run aborts if the bot can bypass every
+restrict-updates ruleset, or if the branch is unprotected entirely.
 
 **Environment-protected secrets** (below) covers code that runs *without* a
 merge: a tag push, a release, a manual or chained dispatch. The merge
@@ -123,11 +126,12 @@ signing keys) live in GitHub Environments whose `deployment_branch_policy`
 lists only admin-gated refs: the default branch (merge restriction) and
 all tags (a sibling tag-target ruleset that gates `creation` and `update`
 with admin-only bypass; `update` is what force-push of an existing tag
-fires, so it must be blocked alongside `creation`). The bot has write
-but not admin, so it cannot push to the default branch and cannot push
-any tag, and therefore cannot reach any environment pinned to those
-refs. The chain holds for workflows whose only path to invocation is
-updating one of those refs: trigger on `push: tags:` (release) or
+fires, so it must be blocked alongside `creation`). The bot has write,
+which is below every role that can bypass, so it cannot push to the
+default branch and cannot push any tag, and therefore cannot reach any
+environment pinned to those refs. The chain holds for workflows whose
+only path to invocation is updating one of those refs: trigger on
+`push: tags:` (release) or
 `push: branches: [main]` (continuous deploy). Other triggers
 (`workflow_dispatch`, `release: published`, `deployment`, `schedule`,
 chained dispatches) can be initiated by a write-scoped bot against an
@@ -135,8 +139,9 @@ allowed ref, so the env policy alone does not gate them; workflows
 keeping those triggers need trigger-specific containment (typically
 required reviewers on the Environment) before release or deploy secrets
 are migrated there. The chain inherits the merge restriction's
-assumption that the bot has write, not admin; an admin session voids
-both the same way.
+assumption that the bot holds no role that can bypass; an admin session
+voids both the same way. `tend check` verifies both halves: the bot's
+role, and that every bypass actor on the merge ruleset outranks write.
 
 OIDC-to-cloud deploys have no GitHub-stored secret to gate; there, the
 Environment plus the cloud provider's trust policy is the only control.
