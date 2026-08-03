@@ -16,25 +16,44 @@ generated workflow names it. What remains:
    `gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <repo> --env tend`, then
    `gh secret delete CLAUDE_CODE_OAUTH_TOKEN --repo <repo>`. Only the
    generated workflows read it, and all of them name the environment, so
-   nothing else breaks. `max-sixty/tend` needs it in `tend-manual` too — the
-   required-reviewer environment `claude-smoke` uses, since a branch dispatch
-   can never reach `tend`.
+   nothing else breaks.
 2. **`max-sixty/worktrunk` and `PRQL/prql` keep a repo-level
    `TEND_BOT_TOKEN`,** because hand-maintained workflows read it outside the
-   generated set: worktrunk's `benchmarks`, `nightly` and `release`, and
-   prql's `pull-request-target`, `release` and `tests`. Most run on
-   `pull_request`, `pull_request_target` or `release`, whose refs a
-   `main`-only deployment-branch policy can never admit, so naming the
-   environment would deny them the secret rather than gate it. Each needs a
-   decision of its own: drop to `GITHUB_TOKEN` where the bot identity isn't
-   load-bearing, split the privileged half behind a dispatch the way
-   `tend-mention`'s relay does, or accept the repo-level copy and allowlist it
-   in `secrets.allowed` with the reason. Until then `repo-secret-allowlist`
-   fails on both, correctly.
+   generated set. What each needs follows from its trigger, and the two repos
+   differ.
+
+   Jobs running at `refs/heads/main` are admitted by the policy as it stands,
+   so `environment: tend` is the whole change: worktrunk's benchmark gist
+   append and its two create-issue-on-failure jobs, prql's
+   `update-rust-toolchain` (all four `schedule`-only, and already `if`-gated
+   to it) and prql's backport. A `pull_request_target` run reports
+   `GITHUB_REF=refs/heads/main` and is admitted — which also means the
+   environment is not what gates that job.
+
+   worktrunk's release jobs run on a tag *push*, which is not bot-steerable,
+   and its all-tags ruleset is admin-gated — but the tag entry does not go on
+   the `tend` policy, whose shape `check_environment` pins to exactly the
+   protected branches and whose `--fix` deletes anything else. They get a
+   second environment (say `release`) whose policy admits the release tag
+   pattern, the shape `check_credential_environments` already credits under
+   that ruleset. Winget and homebrew move in too, and the repo-level copy
+   goes with no new credential.
+
+   prql's release jobs run on `release`, which is bot-steerable: creating a
+   release against an existing tag takes no tag operation, so the tag ruleset
+   does not stop it and a tag entry would not gate it. One of — a required
+   reviewer on a release environment, costing an approval on every release; a
+   second fine-grained credential scoped to `PRQL/homebrew-prql` and the
+   winget fork, left at repo level and allowlisted; or moving the workflow to
+   a tag push, which makes it worktrunk's case. The second narrows furthest
+   only if `push-web-branch` can drop to `GITHUB_TOKEN`, so check whether
+   anything runs on the `web` branch — a `GITHUB_TOKEN` push fires no
+   workflow.
+
+   Until one lands, `repo-secret-allowlist` fails on both, correctly.
 
 `numbagg/numbagg` and `max-sixty/cargo-affected` are done bar the model
-credential. cargo-affected also carries a repo-level `BOT_TOKEN` no workflow
-references — a leftover, deletable once confirmed unused outside Actions.
+credential.
 
 The check also sweeps every *other* credential-holding environment — one
 that stores a secret, or that a job requesting `id-token: write` deploys
