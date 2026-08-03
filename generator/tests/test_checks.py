@@ -12,8 +12,8 @@ from click.testing import CliRunner
 
 from tend.checks import (
     admitted_refs,
+    check_credential_environments,
     check_environment,
-    check_secret_environments,
     fix_environment,
     ROLE_ID_ADMIN,
     ROLE_ID_MAINTAIN,
@@ -91,6 +91,19 @@ def _make_branch_rules(
             rule["ruleset_id"] = ruleset_id
         rules.append(rule)
     return json.dumps(rules)
+
+
+def _workflow_tree(workflows: dict[str, str | None]) -> str:
+    """The GraphQL response `_fetch_workflow_files` reads.
+
+    A None value is a blob GitHub served without text, which the check reports
+    as unread rather than empty.
+    """
+    entries = [
+        {"name": name, "type": "blob", "object": {} if text is None else {"text": text}}
+        for name, text in workflows.items()
+    ]
+    return json.dumps({"data": {"repository": {"object": {"entries": entries}}}})
 
 
 def _role_actor(actor_id: int) -> dict[str, object]:
@@ -862,6 +875,8 @@ def _gh_all_pass(*admitted: str):
     admitted = admitted or ("main",)
 
     def fake(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        if "graphql" in args:
+            return _make_completed(_workflow_tree({}))
         url = _url(args)
         # The common adopter shape: only the ref-gated environment exists.
         if url.endswith("/environments"):
@@ -996,7 +1011,7 @@ def test_run_all_checks_with_protected_branches() -> None:
             _config(protected_branches=["v1", "v2"]),
             repo="owner/repo",
         )
-    # default + v1 + v2 + bot-permission + environment + secret-environments
+    # default + v1 + v2 + bot-permission + environment + credential-environments
     # + secrets + claude-auth + allowlist = 9
     assert len(results) == 9
     bp_results = [r for r in results if r.name.startswith("branch-protection:")]
@@ -1161,7 +1176,7 @@ def test_run_all_checks_deduplicates_default_branch() -> None:
             _config(protected_branches=["main", "v1"]),
             repo="owner/repo",
         )
-    # main (deduped) + v1 + bot-permission + environment + secret-environments
+    # main (deduped) + v1 + bot-permission + environment + credential-environments
     # + secrets + claude-auth + allowlist = 8
     assert len(results) == 8
     bp_results = [r for r in results if r.name.startswith("branch-protection:")]
@@ -1247,8 +1262,13 @@ def test_init_prints_check_reminder(
 
 
 def _url(args: tuple[str, ...]) -> str:
-    """The API path in a `_gh` call, wherever flags put it."""
-    return next(a for a in args if a.startswith("repos/") or a.startswith("orgs/"))
+    """The API path in a `_gh` call, wherever flags put it.
+
+    A `graphql` call carries no path, so it answers with its subcommand.
+    """
+    return next(
+        (a for a in args if a.startswith("repos/") or a.startswith("orgs/")), args[1]
+    )
 
 
 def _env_gh(env_body: str | None, policies: str = "main"):
@@ -1387,17 +1407,24 @@ def test_unverified_protected_branch_is_not_demanded() -> None:
     assert "release" not in env.message
 
 
-def _secret_env_gh(
+def _credential_env_gh(
     environments: dict[str, tuple[list[str], dict, str]],
     tag_rulesets: dict[str, dict] | None = None,
+    workflows: dict[str, str | None] | None = None,
+    unreadable_workflows: bool = False,
 ):
-    """A `_gh` fake serving the calls `check_secret_environments` makes: the
+    """A `_gh` fake serving the calls `check_credential_environments` makes: the
     environment list; per environment its secret names, detail, and
-    deployment-branch-policy lines (`"<type> <name>"` per line); and the tag
-    rulesets (id → detail) the tag gate reads when a policy admits tags."""
+    deployment-branch-policy lines (`"<type> <name>"` per line); the tag
+    rulesets (id → detail) the tag gate reads when a policy admits tags; and
+    the workflow tree the OIDC and trigger reads parse."""
     tag_rulesets = tag_rulesets or {}
 
     def fake(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+        if "graphql" in args:
+            if unreadable_workflows:
+                return _make_completed(returncode=1)
+            return _make_completed(_workflow_tree(workflows or {}))
         url = args[-3] if "--jq" in args else args[-1]
         if url.endswith("/environments"):
             return _make_completed("\n".join(environments) + "\n")
@@ -1453,146 +1480,152 @@ _CUSTOM_POLICY = {
 }
 
 
-def test_secret_environments_none_holding_secrets_passes() -> None:
+def test_credential_environments_none_holding_secrets_passes() -> None:
     """Before the migration nothing holds any secret, and an environment
     holding none has nothing to gate."""
-    fake = _secret_env_gh({"tend": ([], {}, ""), "github-pages": ([], {}, "")})
+    fake = _credential_env_gh({"tend": ([], {}, ""), "github-pages": ([], {}, "")})
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is True
 
 
-def test_secret_environments_covers_release_secrets() -> None:
+def test_credential_environments_covers_release_secrets() -> None:
     """The sweep is every secret, not the operational names: an ungated
     environment holding only a release token is readable by a workflow the
     bot pushes naming it, which is the same exposure with a different key."""
-    fake = _secret_env_gh({"pypi": (["PYPI_TOKEN"], {}, "")})
+    fake = _credential_env_gh({"pypi": (["PYPI_TOKEN"], {}, "")})
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is False
     assert "pypi" in result.message
 
 
-def test_secret_environments_tend_is_gated_by_its_policy() -> None:
+def test_credential_environments_tend_is_gated_by_its_policy() -> None:
     """`tend` earns its pass from the branch policy the `environment` check
     verifies, so holding the secrets there is not a finding."""
-    fake = _secret_env_gh({"tend": (["T1", "T2"], {}, "")})
+    fake = _credential_env_gh({"tend": (["T1", "T2"], {}, "")})
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is True
     assert "tend" in result.message
 
 
-def test_secret_environments_flags_an_ungated_holder() -> None:
+def test_credential_environments_flags_an_ungated_holder() -> None:
     """No reviewer and no policy leaves the secrets on every ref."""
-    fake = _secret_env_gh({"tend-manual": (["T1"], {"protection_rules": []}, "")})
+    fake = _credential_env_gh({"tend-manual": (["T1"], {"protection_rules": []}, "")})
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is False
     assert "no required reviewers" in result.message
 
 
-def test_secret_environments_is_keyed_on_secrets_not_on_the_name() -> None:
+def test_credential_environments_is_keyed_on_secrets_not_on_the_name() -> None:
     """The gate must not depend on the name `tend-manual`: renaming the
     environment, or standing a second one beside it, must still be checked."""
-    fake = _secret_env_gh({"smoke-secrets": (["T2"], {"protection_rules": []}, "")})
+    fake = _credential_env_gh({"smoke-secrets": (["T2"], {"protection_rules": []}, "")})
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is False
     assert "smoke-secrets" in result.message
 
 
-def test_secret_environments_accepts_a_human_reviewer() -> None:
-    fake = _secret_env_gh(
+def test_credential_environments_accepts_a_human_reviewer() -> None:
+    fake = _credential_env_gh(
         {"tend-manual": (["T1"], _reviewers(("User", "maintainer")), "")}
     )
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is True
 
 
-def test_secret_environments_rejects_the_bot_as_reviewer() -> None:
+def test_credential_environments_rejects_the_bot_as_reviewer() -> None:
     """Case-insensitively: GitHub logins are, and the config takes whatever
     case the maintainer typed."""
-    fake = _secret_env_gh({"tend-manual": (["T1"], _reviewers(("User", "Bot")), "")})
+    fake = _credential_env_gh(
+        {"tend-manual": (["T1"], _reviewers(("User", "Bot")), "")}
+    )
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments(
+        result = check_credential_environments(
             "owner/repo", _config(bot_name="bot"), ["main"]
         )
     assert result.passed is False
     assert "approves its own run" in result.message
 
 
-def test_secret_environments_team_reviewer_is_unverifiable() -> None:
+def test_credential_environments_team_reviewer_is_unverifiable() -> None:
     """Team membership is invisible here, so the bot may be in it — the same
     stance the ruleset check takes on a Team bypass actor."""
-    fake = _secret_env_gh({"tend-manual": (["T1"], _reviewers(("Team", "maints")), "")})
+    fake = _credential_env_gh(
+        {"tend-manual": (["T1"], _reviewers(("Team", "maints")), "")}
+    )
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is False
     assert "team" in result.message
 
 
-def test_secret_environments_accepts_a_verified_branch_policy() -> None:
+def test_credential_environments_accepts_a_verified_branch_policy() -> None:
     """A reviewer is one gate; a policy admitting only verified refs is the
     other — a deploy environment pinned to the default branch needs no human."""
-    fake = _secret_env_gh({"deploy": (["DEPLOY_KEY"], _CUSTOM_POLICY, "branch main")})
+    fake = _credential_env_gh(
+        {"deploy": (["DEPLOY_KEY"], _CUSTOM_POLICY, "branch main")}
+    )
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is True
 
 
-def test_secret_environments_rejects_an_unverified_branch_policy() -> None:
+def test_credential_environments_rejects_an_unverified_branch_policy() -> None:
     """A policy entry naming a ref outside the verified set is one the bot may
     be able to write — including a pattern, which cannot be verified at all."""
-    fake = _secret_env_gh(
+    fake = _credential_env_gh(
         {"deploy": (["DEPLOY_KEY"], _CUSTOM_POLICY, "branch staging")}
     )
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is False
     assert "staging" in result.message
 
 
-def test_secret_environments_accepts_tags_under_an_admin_ruleset() -> None:
+def test_credential_environments_accepts_tags_under_an_admin_ruleset() -> None:
     """A release environment must admit tags to run on tag pushes; that is a
     gate only while an all-tags ruleset keeps the bot from minting one."""
-    fake = _secret_env_gh(
+    fake = _credential_env_gh(
         {"release": (["PYPI_TOKEN"], _CUSTOM_POLICY, "branch main\ntag v*")},
         tag_rulesets={"7": _ADMIN_TAG_RULESET},
     )
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is True, result.message
 
 
-def test_secret_environments_rejects_tags_without_a_ruleset() -> None:
+def test_credential_environments_rejects_tags_without_a_ruleset() -> None:
     """With no admin-gated all-tags ruleset, a tag entry admits a ref the bot
     can create, workflow file and all."""
-    fake = _secret_env_gh(
+    fake = _credential_env_gh(
         {"release": (["PYPI_TOKEN"], _CUSTOM_POLICY, "branch main\ntag v*")}
     )
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is False
     assert "admits tags" in result.message
 
 
-def test_secret_environments_bot_bypassable_tag_ruleset_does_not_gate() -> None:
+def test_credential_environments_bot_bypassable_tag_ruleset_does_not_gate() -> None:
     """A tag ruleset whose bypass list includes a write-level role is one the
     bot walks through, so it must not credit the tag entries."""
     bypassable = dict(_ADMIN_TAG_RULESET, bypass_actors=[_role_actor(ROLE_ID_WRITE)])
-    fake = _secret_env_gh(
+    fake = _credential_env_gh(
         {"release": (["PYPI_TOKEN"], _CUSTOM_POLICY, "tag v*")},
         tag_rulesets={"7": bypassable},
     )
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is False
     assert "admits tags" in result.message
 
 
-def test_secret_environments_unreadable_does_not_pass() -> None:
+def test_credential_environments_unreadable_does_not_pass() -> None:
     """A 403 listing secrets must not read as 'holds none' — that would clear
     an ungated environment whenever the request failed."""
 
@@ -1603,8 +1636,304 @@ def test_secret_environments_unreadable_does_not_pass() -> None:
         return _make_completed(stderr="HTTP 403", returncode=1)
 
     with patch("tend.checks._gh", side_effect=fake):
-        result = check_secret_environments("owner/repo", _config(), ["main"])
+        result = check_credential_environments("owner/repo", _config(), ["main"])
     assert result.passed is None
+
+
+# ---------------------------------------------------------------------------
+# What the workflows add to the sweep: OIDC, and triggers the bot steers
+#
+# A trusted-publishing repo stores no secret at all, so a sweep keyed on
+# stored secrets walks past exactly the repos that publish. And a ref policy
+# gates which ref a run starts from, not who starts it, so a trigger the bot
+# both fires and fills in escapes it.
+# ---------------------------------------------------------------------------
+
+_OIDC_PUBLISH = """
+name: release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - run: echo publish
+"""
+
+
+def _credential_check(
+    environments: dict[str, tuple[list[str], dict, str]], **kwargs
+) -> CheckResult:
+    fake = _credential_env_gh(environments, **kwargs)
+    with patch("tend.checks._gh", side_effect=fake):
+        return check_credential_environments("owner/repo", _config(), ["main"])
+
+
+def test_credential_environments_oidc_environment_without_secrets_is_swept() -> None:
+    """Trusted publishing stores no secret: the credential is the OIDC token
+    the environment's name appears in. An ungated environment a publish job
+    mints one in is the same exposure as an ungated token."""
+    result = _credential_check(
+        {"pypi": ([], {"protection_rules": []}, "")},
+        workflows={"release.yaml": _OIDC_PUBLISH},
+    )
+    assert result.passed is False
+    assert "pypi" in result.message
+
+
+def test_credential_environments_environment_holding_nothing_is_ignored() -> None:
+    """A repo that publishes nothing must not be told it is misconfigured: an
+    environment with no secret and no OIDC job is a deployment label."""
+    result = _credential_check(
+        {"github-pages": ([], {"protection_rules": []}, "")},
+        workflows={
+            "pages.yaml": "on: push\njobs:\n  build:\n    environment: github-pages\n"
+        },
+    )
+    assert result.passed is True
+
+
+def test_credential_environments_oidc_outside_any_environment_fails() -> None:
+    """Named in no environment, the minted token carries no environment claim
+    and nothing gates the ref it comes from."""
+    result = _credential_check(
+        {},
+        workflows={
+            "release.yaml": (
+                "on: push\n"
+                "jobs:\n"
+                "  publish:\n"
+                "    permissions:\n"
+                "      id-token: write\n"
+                "    steps:\n"
+                "      - run: echo publish\n"
+            )
+        },
+    )
+    assert result.passed is False
+    assert "id-token: write" in result.message
+    assert "release.yaml:publish" in result.message
+
+
+def test_credential_environments_write_all_grants_oidc() -> None:
+    """`permissions: write-all` is the shorthand that includes `id-token`."""
+    result = _credential_check(
+        {},
+        workflows={
+            "release.yaml": (
+                "on: push\npermissions: write-all\njobs:\n  publish:\n"
+                "    steps:\n      - run: echo publish\n"
+            )
+        },
+    )
+    assert result.passed is False
+    assert "id-token: write" in result.message
+
+
+def test_credential_environments_job_permissions_replace_the_workflow_block() -> None:
+    """GitHub's `permissions:` does not merge — a job block replaces the
+    workflow one outright, so a job that drops `id-token` mints nothing."""
+    result = _credential_check(
+        {},
+        workflows={
+            "release.yaml": (
+                "on: push\n"
+                "permissions:\n"
+                "  id-token: write\n"
+                "jobs:\n"
+                "  publish:\n"
+                "    permissions:\n"
+                "      contents: read\n"
+                "    steps:\n"
+                "      - run: echo publish\n"
+            )
+        },
+    )
+    assert result.passed is True
+
+
+def test_credential_environments_steerable_trigger_defeats_a_ref_policy() -> None:
+    """A write-scoped actor creating a release against an existing tag takes no
+    tag operation, and writes the run's payload itself — so the policy admits
+    the ref and the bot supplies the code."""
+    result = _credential_check(
+        {"pypi": (["PYPI_TOKEN"], _CUSTOM_POLICY, "branch main")},
+        workflows={
+            "release.yaml": (
+                "on:\n"
+                "  release:\n"
+                "    types: [published]\n"
+                "jobs:\n"
+                "  publish:\n"
+                "    environment: pypi\n"
+                "    steps:\n"
+                "      - run: echo publish\n"
+            )
+        },
+    )
+    assert result.passed is False
+    assert "`release`" in result.message
+
+
+def test_credential_environments_reviewers_cover_a_steerable_trigger() -> None:
+    """Required reviewers gate every trigger, ref-independent — the one control
+    that covers the triggers a ref policy cannot."""
+    result = _credential_check(
+        {"pypi": (["PYPI_TOKEN"], _reviewers(("User", "maintainer")), "")},
+        workflows={
+            "release.yaml": (
+                "on:\n  release:\n    types: [published]\n"
+                "jobs:\n  publish:\n    environment: pypi\n"
+            )
+        },
+    )
+    assert result.passed is True
+
+
+def test_credential_environments_input_free_dispatch_is_not_steerable() -> None:
+    """Without inputs a dispatch runs the code the ref already carries, so
+    against an admitted ref it re-publishes what an admin published."""
+    result = _credential_check(
+        {"pypi": (["PYPI_TOKEN"], _CUSTOM_POLICY, "branch main")},
+        workflows={
+            "release.yaml": (
+                "on:\n"
+                "  workflow_dispatch:\n"
+                "  push:\n"
+                "    tags: ['v*']\n"
+                "jobs:\n"
+                "  publish:\n"
+                "    environment: pypi\n"
+            )
+        },
+    )
+    assert result.passed is True
+
+
+def test_credential_environments_dispatch_with_inputs_is_steerable() -> None:
+    result = _credential_check(
+        {"pypi": (["PYPI_TOKEN"], _CUSTOM_POLICY, "branch main")},
+        workflows={
+            "release.yaml": (
+                "on:\n"
+                "  workflow_dispatch:\n"
+                "    inputs:\n"
+                "      version:\n"
+                "        required: true\n"
+                "jobs:\n"
+                "  publish:\n"
+                "    environment: pypi\n"
+            )
+        },
+    )
+    assert result.passed is False
+    assert "`workflow_dispatch`" in result.message
+
+
+def test_credential_environments_reusable_workflow_inherits_caller_triggers() -> None:
+    """A reusable workflow's own `on:` says only that it is callable; what can
+    start it is whatever starts its callers."""
+    result = _credential_check(
+        {"pypi": (["PYPI_TOKEN"], _CUSTOM_POLICY, "branch main")},
+        workflows={
+            "dispatch.yaml": (
+                "on:\n"
+                "  repository_dispatch:\n"
+                "    types: [publish]\n"
+                "jobs:\n"
+                "  call:\n"
+                "    uses: ./.github/workflows/publish.yaml\n"
+            ),
+            "publish.yaml": (
+                "on:\n  workflow_call:\njobs:\n  publish:\n    environment: pypi\n"
+            ),
+        },
+    )
+    assert result.passed is False
+    assert "`repository_dispatch`" in result.message
+
+
+def test_credential_environments_reusable_caller_job_is_not_ungated_oidc() -> None:
+    """A `uses:` job declares no environment of its own and mints nothing —
+    its `permissions:` only caps what the callee may request."""
+    result = _credential_check(
+        {"pypi": (["PYPI_TOKEN"], _CUSTOM_POLICY, "branch main")},
+        workflows={
+            "release.yaml": (
+                "on: push\n"
+                "jobs:\n"
+                "  call:\n"
+                "    uses: ./.github/workflows/publish.yaml\n"
+                "    permissions:\n"
+                "      id-token: write\n"
+            ),
+            "publish.yaml": (
+                "on:\n  workflow_call:\njobs:\n  publish:\n    environment: pypi\n"
+            ),
+        },
+    )
+    assert result.passed is True
+
+
+def test_credential_environments_unreached_reusable_workflow_is_unverified() -> None:
+    """Its callers may live in another repo, which this cannot enumerate."""
+    result = _credential_check(
+        {"pypi": (["PYPI_TOKEN"], _CUSTOM_POLICY, "branch main")},
+        workflows={
+            "publish.yaml": (
+                "on:\n  workflow_call:\njobs:\n  publish:\n    environment: pypi\n"
+            )
+        },
+    )
+    assert result.passed is None
+    assert "workflow_call" in result.message
+
+
+def test_credential_environments_dynamic_environment_name_is_unverified() -> None:
+    result = _credential_check(
+        {},
+        workflows={
+            "deploy.yaml": (
+                "on: push\njobs:\n  deploy:\n    environment: ${{ github.ref_name }}\n"
+            )
+        },
+    )
+    assert result.passed is None
+    assert "dynamically" in result.message
+
+
+def test_credential_environments_unparsable_workflow_is_unverified() -> None:
+    result = _credential_check({}, workflows={"broken.yaml": "jobs: {unclosed\n"})
+    assert result.passed is None
+    assert "could not be parsed" in result.message
+
+
+def test_credential_environments_unreadable_workflow_tree_is_unverified() -> None:
+    result = _credential_check({}, unreadable_workflows=True)
+    assert result.passed is None
+    assert ".github/workflows could not be read" in result.message
+
+
+def test_credential_environments_untexted_blob_is_unverified() -> None:
+    """GitHub serves no `text` for an oversized or binary blob; that is unread,
+    not empty."""
+    result = _credential_check({}, workflows={"release.yaml": None})
+    assert result.passed is None
+    assert "could not be read" in result.message
+
+
+def test_credential_environments_a_definite_gap_outranks_unverified() -> None:
+    """An unreadable corner must not downgrade a hole tend can already see."""
+    result = _credential_check(
+        {"pypi": (["PYPI_TOKEN"], {"protection_rules": []}, "")},
+        workflows={"broken.yaml": "jobs: {unclosed\n"},
+    )
+    assert result.passed is False
+    assert "pypi" in result.message
 
 
 def test_fix_environment_reconciles_the_admitted_set() -> None:

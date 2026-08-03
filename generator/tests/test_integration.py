@@ -111,8 +111,10 @@ def test_init_workflows_have_correct_triggers(
 def test_init_workflows_have_required_permissions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """All workflows must request contents:write, pull-requests:write, and
-    id-token:write for the tend action to function."""
+    """All workflows must request contents:write and pull-requests:write for
+    the tend action to function — and must not request id-token:write, which
+    nothing in the action chain uses and which would let the most exposed job
+    in the repo mint the repository's OIDC identity."""
     _write_config(tmp_path, "bot_name: test-bot")
     monkeypatch.chdir(tmp_path)
     _run_init()
@@ -139,8 +141,8 @@ def test_init_workflows_have_required_permissions(
             assert perms.get("pull-requests") == "write", (
                 f"{path.name}:{job_name} missing pull-requests:write"
             )
-            assert perms.get("id-token") == "write", (
-                f"{path.name}:{job_name} missing id-token:write"
+            assert "id-token" not in perms, (
+                f"{path.name}:{job_name} grants id-token, which tend does not use"
             )
     assert checked == 7, "every workflow must contribute one agent job"
 
@@ -302,6 +304,12 @@ def _make_completed(
 
 def _fake_gh_all_pass(*args: str, **kwargs: str) -> subprocess.CompletedProcess[str]:
     """Simulate a gh CLI where all checks pass for owner/repo."""
+    if "graphql" in args:
+        # The workflow tree the credential sweep reads: no workflows, so no
+        # OIDC job and no trigger the bot steers.
+        return _make_completed(
+            json.dumps({"data": {"repository": {"object": {"entries": []}}}})
+        )
     url = next(a for a in args if a.startswith("repos/") or a.startswith("orgs/"))
     # Only the ref-gated environment exists, holding the operational secrets.
     if url.endswith("/environments"):
@@ -396,7 +404,7 @@ def test_check_full_pipeline_with_mocked_gh(
 
     assert result.exit_code == 0, result.output
     assert "FAIL" not in result.output
-    # branch-protection + bot-permission + environment + secret-environments
+    # branch-protection + bot-permission + environment + credential-environments
     # + secrets + claude-auth + allowlist = 7
     assert result.output.count("PASS") == 7
 

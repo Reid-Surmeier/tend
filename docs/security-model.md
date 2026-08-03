@@ -81,14 +81,19 @@ restriction) nor any tag (tag ruleset), and managing environments — the
 policy and the secrets inside — requires admin, which the bot also lacks.
 
 The claim in sentence 2 is the conjunction of three checks, each keyed on
-where a secret can live:
+where a credential can live:
 
-- *Every secret-holding environment is gated* (`secret-environments`): a
-  required reviewer who is not the bot, or a deployment policy naming only
-  verified refs — branches the same run confirmed the bot cannot write,
-  or tags under an admin-only all-tags ruleset. This covers release
-  tokens exactly as it covers tend's own secrets, keyed on holding
-  secrets rather than on any environment name.
+- *Every credential-holding environment is gated*
+  (`credential-environments`): a required reviewer who is not the bot, or
+  a deployment policy naming only verified refs — branches the same run
+  confirmed the bot cannot write, or tags under an admin-only all-tags
+  ruleset — with no workflow reaching it on a trigger the bot steers. This
+  covers release tokens exactly as it covers tend's own secrets, keyed on
+  holding a credential rather than on any environment name. A credential
+  is a stored secret, or the OIDC token a job minting `id-token: write`
+  in the environment's name can spend: trusted publishing (PyPI, npm, a
+  cloud role) stores nothing, so a sweep reading stored secrets alone
+  walks past exactly the repos that publish.
 - *No repo-level secret outside the allowlist* (`repo-secret-allowlist`):
   a repo-level secret is readable by any workflow the repo runs, so each
   one must be a deliberate `secrets.allowed` entry — and the operational
@@ -178,25 +183,46 @@ to it.
 adopter-owned environments whose policies list the default branch and/or
 all tags (a tag-target ruleset gates `creation` and `update` with
 admin-only bypass; `update` is what force-push of an existing tag fires, so
-it must be blocked alongside `creation`). The `secret-environments` sweep
-above verifies every such environment.
+it must be blocked alongside `creation`). Rulesets are the only mechanism —
+GitHub sunset tag protection rules in 2024 — and the `creation` rule also
+refuses `POST /repos/{repo}/releases` when the named tag does not exist
+yet, so the Releases API is not a way around it. The
+`credential-environments` sweep above verifies every such environment.
 
 The gate bounds what a run can *read*; it does not by itself bound *when*
 a reviewed workflow fires. A workflow reachable only by updating a gated
 ref (`push: tags:` for release, `push: branches: [main]` for continuous
-deploy) is fully chained: causing the run at all takes an admin action.
-Triggers a write-scoped bot can fire itself against an allowed ref
-(`workflow_dispatch`, `release: published`, `deployment`, `schedule`,
-chained dispatches) still run only reviewed workflow files with the
-secrets used as written — but firing a deploy is itself an outcome, so
-those workflows want a required reviewer. Tend's convention for one is a
-second environment, `tend-manual`, holding the same secrets behind a
-reviewer instead of a branch policy, so each run waits for a human; the
-same sweep verifies it, keyed on the secrets rather than the name, with
-the bot excluded from the reviewer list since a bot that can approve its
-own run makes the wait a formality. OIDC-to-cloud deploys have no
-GitHub-stored secret to gate; there, the Environment plus the cloud
-provider's trust policy is the only control.
+deploy) is fully chained: causing the run at all takes an admin action, and
+the code the run executes is fixed by the ref, so the worst a write-scoped
+bot achieves is re-publishing what an admin already published. `schedule`,
+`workflow_run`, `deployment` and an input-free `workflow_dispatch` sit in
+that class too.
+
+Three triggers do not, because the bot supplies the run's payload as well
+as firing it, and it fires them at a ref the policy already admits:
+`release: published` (creating a release against an existing tag takes no
+tag operation, and the release's body and assets are the bot's own),
+`repository_dispatch` (`client_payload` wholesale), and a
+`workflow_dispatch` carrying inputs. A ref policy cannot gate these; only a
+required reviewer can, since it holds every trigger regardless of ref. The
+sweep therefore refuses a ref-gated environment that a workflow reaches on
+one of the three. Tend's convention for a reviewer gate is a second
+environment, `tend-manual`, holding the same secrets behind a reviewer
+instead of a branch policy, so each run waits for a human; the same sweep
+verifies it, keyed on the credential rather than the name, with the bot
+excluded from the reviewer list since a bot that can approve its own run
+makes the wait a formality.
+
+An OIDC publish or deploy (PyPI or npm trusted publishing, a cloud role)
+stores no secret, so the environment is the whole gate on GitHub's side —
+the token's `sub` names it, and a relying party can require that claim. A
+job holding `id-token: write` outside any environment has no gate at all:
+the token carries no environment claim, and the bot can mint it from a
+branch it pushes, which any trust policy pinning the repository but not the
+ref accepts. The sweep covers both cases: an environment a job mints OIDC
+in holds a credential even with nothing stored in it, and a job minting one
+outside any environment is reported on its own. Tend's own generated
+workflows request no `id-token`.
 
 *Migration.* Environment secrets overlay repo-level ones, and a job naming
 an environment that does not yet exist auto-creates it with no policy and

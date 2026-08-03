@@ -64,19 +64,26 @@ and their release secrets live there rather than at repo level. A leaked
 bot token can push a non-default branch, but no ref it can push matches
 such a policy, so the deploy job is rejected before it reads the secret:
 no admin operation → no admin-gated ref → no environment access → no
-secret. `tend check` sweeps every secret-holding environment — release
+secret. `tend check` sweeps every credential-holding environment — release
 and operational alike — and fails on any it cannot confirm gated by a
 non-bot reviewer or a policy of verified refs, so the chain is checked
-rather than assumed.
+rather than assumed. A credential is a stored secret or the OIDC token a
+job requesting `id-token: write` mints in the environment's name, so a
+trusted-publishing repo that stores nothing is swept the same way.
 
 That holds only for a workflow whose sole path to invocation is updating
 an admin-gated ref (`push: tags:`, or `push:` on the default branch).
-Triggers a write-scoped bot can fire itself — `workflow_dispatch`,
-`release: published`, `deployment`, `schedule`, chained dispatches — need
-containment of their own, typically required reviewers on the
-Environment. The canonical treatment, including which triggers were
-probed rather than inferred, is the source repo's `docs/security-model.md`
-linked above; install does not configure release secrets.
+Three triggers let a write-scoped bot supply the run's payload as well as
+fire it, at a ref the policy already admits: `release: published`
+(creating a release against an existing tag takes no tag operation),
+`repository_dispatch`, and a `workflow_dispatch` carrying inputs. Those
+need a required reviewer on the Environment, which holds regardless of
+ref. A job requesting `id-token: write` outside any environment has no
+gate at all — the token carries no environment claim, and the bot can
+mint it from a branch it pushes. The canonical treatment, including which
+triggers were probed rather than inferred, is the source repo's
+`docs/security-model.md` linked above; install does not configure release
+secrets.
 
 The composite action refuses to start if the default branch is unprotected.
 

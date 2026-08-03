@@ -117,11 +117,15 @@ place. Classify each remaining secret and act now — don't defer:
   merge. Don't allowlist them. Migrate each to a GitHub Environment whose
   deployment policy pins to the admin-gated refs from §3 (the default
   branch and/or all tags). The bot can reach neither ref class, so it
-  cannot reach the secret. `tend check` sweeps every secret-holding
-  environment and fails on any it cannot confirm gated — no reviewer and
-  no policy, an unverified branch entry, or tag entries without §3's
-  all-tags ruleset — so a half-migrated environment surfaces on the next
-  check rather than passing silently.
+  cannot reach the secret. `tend check` sweeps every credential-holding
+  environment — one that stores a secret, or that an `id-token: write` job
+  deploys to, since trusted publishing stores nothing — and fails on any it
+  cannot confirm gated: no reviewer and no policy, an unverified branch
+  entry, tag entries without §3's all-tags ruleset, or a ref policy on an
+  environment some workflow reaches on `release`, `repository_dispatch`, or
+  a `workflow_dispatch` with inputs, which the bot fires at a ref the policy
+  already admits. A half-migrated environment surfaces on the next check
+  rather than passing silently.
 
   Migrate the secret: recreate it on the Environment, delete the
   repo-level copy (confirm via `AskUserQuestion` first), and set
@@ -359,21 +363,56 @@ Bot-deleting an admin-pushed tag is brief availability damage at worst;
 repos that need stronger protection against published-tag deletion can
 add a no-bypass `deletion` ruleset (see the publisher uplift below).
 
+**Environment ref policies.** A ruleset only helps once an Environment
+names the refs it protects. A new Environment defaults to
+`deployment_branch_policy: null`, which admits every ref — so a bot-pushed
+branch or tag reaches its secrets and mints its OIDC token. Survey what
+exists, including environments GitHub created on the repo's behalf
+(`github-pages`) and ones that predate tend:
+
+```bash
+gh api "repos/$REPO/environments" \
+  --jq '.environments[] | {name, deployment_branch_policy, rules: [.protection_rules[].type]}'
+```
+
+Pin each environment that holds a secret, or that a job with
+`id-token: write` names, to the admin-gated refs its workflows actually
+use — all tags for a release, the default branch for a continuous deploy:
+
+```bash
+gh api "repos/$REPO/environments/$ENV" --method PUT --input - << 'EOF'
+{"deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
+EOF
+gh api "repos/$REPO/environments/$ENV/deployment-branch-policies" \
+  --method POST -f name='*' -f type=tag
+```
+
+`type` is `tag` or `branch` and defaults to `branch` when omitted, so a
+tag entry that leaves it out silently protects nothing. Prefer this
+explicit list to the "protected branches only" setting, which admits any
+branch carrying a *classic* protection rule — a set that grows as
+branches are created, and that excludes a branch protected by the
+ruleset above.
+
 **Release/deploy workflow design.** Workflows that use release or deploy
 secrets must trigger on `push: tags:` (release) or `push: branches: [main]`
 (continuous deploy from the default branch), and reference an Environment
 (§1). Don't trigger on `pull_request`. A `pull_request` workflow runs the
 YAML at the PR's head ref, which a bot can write, so the workflow code is
 no longer admin-vetted and the chain breaks at the workflow file itself.
-Other triggers (`workflow_dispatch`, `release: published`, `deployment`,
-`schedule`) are outside the packaged recipe. Their workflow files run
-from the default branch (so code is admin-vetted), but they can be
-initiated by a write-scoped bot against an admin-gated ref, which means
-the env policy alone does not stop the bot from firing them at unwanted
-times. If a repo keeps such a trigger on a release/deploy workflow,
-treat it as a custom design and verify the trigger-specific proof
-(usually: gate the env with required reviewers on top of the chain) per
-workflow before migrating release or deploy secrets to that env.
+Triggers a write-scoped bot can fire *and* steer are outside the packaged
+recipe: `release: published` (creating a release against an existing tag
+takes no tag operation, and its body and assets are the bot's),
+`repository_dispatch`, and a `workflow_dispatch` carrying inputs. Their
+workflow files still run from the default branch, so the code is
+admin-vetted, but the bot chooses when they fire and what payload they
+see. If a repo keeps one on a release/deploy workflow, gate that
+Environment with required reviewers before migrating release or deploy
+secrets to it.
+
+Run `uvx tend@latest check` after this section; its
+`credential-environments` line reports any environment still reachable by
+the bot.
 
 **More complicated approaches are possible** (per-pattern tag rulesets,
 mixed bypass actors, layered no-bypass immutability rulesets for repos

@@ -2,22 +2,28 @@
 
 Verifies the two boundaries docs/security-model.md claims: the bot cannot
 land code (branch protection on configured branches, bot permission level),
-and a run the bot can cause reads no secrets (the `tend` environment's
-deployment branch policy, every other secret-holding environment's gate,
+and a run the bot can cause reaches no credential (the `tend` environment's
+deployment branch policy, every other credential-holding environment's gate,
 the operational secrets living in the environment, and no repo-level secret
 outside the allowlist).
 
 Uses the `gh` CLI for GitHub API access. Checks degrade gracefully when
-gh is unavailable or the token lacks permission.
+gh is unavailable or the token lacks permission. Everything read here is
+readable with the bot's own write-scoped token, so the nightly run sees
+the same answers a maintainer does.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import subprocess
 from dataclasses import dataclass
 from functools import cache
+
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
 
 from tend.config import Config
 from tend.workflows import TEND_ENVIRONMENT
@@ -45,6 +51,25 @@ BYPASS_ROLE_IDS = frozenset({ROLE_ID_MAINTAIN, ROLE_ID_ADMIN})
 # Integration, DeployKey) name a principal whose membership isn't visible from
 # the ruleset, so the bot can't be ruled out.
 BYPASS_ACTOR_TYPES_ABOVE_BOT = frozenset({"OrganizationAdmin", "EnterpriseOwner"})
+
+# Triggers a write-scoped actor can both fire *and* steer — it decides not only
+# that the run happens but what the run publishes. A deployment branch policy
+# does not gate these, because the actor fires them at a ref the policy already
+# admits; only a required reviewer does. Verified against live GitHub with a
+# write-access (non-admin, non-bypass) collaborator:
+#
+#   - `release`: creating a release against an *existing* tag takes no tag
+#     operation, so a tag ruleset does not stop it — and the release's body and
+#     uploaded assets are the actor's own.
+#   - `repository_dispatch`: the actor supplies `client_payload` wholesale.
+#   - `workflow_dispatch` *with inputs* (added per workflow, not listed here):
+#     the actor supplies the inputs.
+#
+# A `workflow_dispatch` with no inputs is deliberately absent, as are `push`,
+# `create`, `pull_request`, `workflow_run`, `deployment` and `schedule`: each
+# runs code fixed by the ref, so against an admin-gated ref the worst the actor
+# achieves is re-publishing what an admin already published.
+BOT_STEERABLE_TRIGGERS = frozenset({"release", "repository_dispatch"})
 
 
 @dataclass
@@ -538,6 +563,271 @@ def check_environment(repo: str, admitted: list[str]) -> CheckResult:
     )
 
 
+_WORKFLOWS_QUERY = """
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    object(expression: "HEAD:.github/workflows") {
+      ... on Tree {
+        entries { name type object { ... on Blob { text } } }
+      }
+    }
+  }
+}
+"""
+
+
+def _fetch_workflow_files(repo: str) -> dict[str, str | None] | None:
+    """Every workflow file on the repo's default branch, in one GraphQL call.
+
+    Values are the file text, or None for a blob GitHub served without text
+    (binary or oversized) — the caller reports those as unread rather than
+    treating them as empty.
+
+    Returns an empty dict when the repo has no `.github/workflows`, and None
+    when the tree could not be read at all.
+    """
+    owner, _, name = repo.partition("/")
+    if not owner or not name:
+        return None
+    result = _gh(
+        "api",
+        "graphql",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+        "-f",
+        f"query={_WORKFLOWS_QUERY}",
+    )
+    if result is None or result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    repository = (data.get("data") or {}).get("repository")
+    if not isinstance(repository, dict):
+        return None
+    tree = repository.get("object")
+    if tree is None:
+        return {}
+    files: dict[str, str | None] = {}
+    for entry in tree.get("entries", []):
+        entry_name = entry.get("name", "")
+        if entry.get("type") != "blob" or not entry_name.endswith((".yml", ".yaml")):
+            continue
+        files[entry_name] = (entry.get("object") or {}).get("text")
+    return files
+
+
+@dataclass(frozen=True)
+class _WorkflowFacts:
+    """What one workflow file says about the repo's credential surface."""
+
+    path: str
+    steerable: frozenset[str]  # bot-steerable triggers it carries
+    reusable: bool  # declares `workflow_call`
+    calls: frozenset[str]  # local reusable workflows this one invokes
+    environments: frozenset[str]  # environments its jobs deploy to
+    oidc_environments: frozenset[str]  # …of those, ones a job mints OIDC in
+    oidc_without_environment: frozenset[str]  # job ids minting OIDC ungated
+    unresolved: tuple[str, ...]
+
+
+def _permissions_grant_oidc(permissions: object) -> bool:
+    """Whether a `permissions:` block lets the job mint an OIDC token."""
+    if isinstance(permissions, str):
+        return permissions == "write-all"
+    if isinstance(permissions, dict):
+        return permissions.get("id-token") == "write"
+    return False
+
+
+def _parse_workflow(path: str, text: str) -> _WorkflowFacts:
+    """Read one workflow's triggers, environments, and OIDC use.
+
+    Anything the parse cannot decide (an unparsable file, an environment named
+    by an expression) lands in `unresolved` rather than being silently dropped
+    — a path tend cannot see is not a path tend can call gated.
+    """
+    unparsable = (f"{path} could not be parsed as a workflow",)
+    empty = frozenset[str]()
+    try:
+        data = YAML(typ="safe").load(io.StringIO(text))
+    except (YAMLError, ValueError):
+        return _WorkflowFacts(
+            path, empty, False, empty, empty, empty, empty, unparsable
+        )
+    if not isinstance(data, dict):
+        return _WorkflowFacts(
+            path, empty, False, empty, empty, empty, empty, unparsable
+        )
+
+    # YAML 1.1 documents (`%YAML 1.1`) turn the `on:` key into the boolean
+    # True; 1.2, which ruamel's safe loader defaults to, keeps it a string.
+    on = data.get("on", data.get(True))
+    if isinstance(on, str):
+        triggers = {on}
+    elif isinstance(on, (list, dict)):
+        triggers = {t for t in on if isinstance(t, str)}
+    else:
+        triggers = set()
+
+    steerable = triggers & BOT_STEERABLE_TRIGGERS
+    dispatch = on.get("workflow_dispatch") if isinstance(on, dict) else None
+    if isinstance(dispatch, dict) and dispatch.get("inputs"):
+        steerable.add("workflow_dispatch")
+
+    workflow_permissions = data.get("permissions")
+    jobs = data.get("jobs")
+    jobs = jobs if isinstance(jobs, dict) else {}
+
+    calls: set[str] = set()
+    environments: set[str] = set()
+    oidc_environments: set[str] = set()
+    oidc_without_environment: set[str] = set()
+    unresolved: list[str] = []
+
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        uses = job.get("uses")
+        if uses is not None:
+            # A job that calls another workflow declares no environment of its
+            # own — the called workflow's jobs do, and those are parsed there.
+            # Its `permissions:` only caps what the callee may request.
+            if isinstance(uses, str) and uses.startswith("./.github/workflows/"):
+                calls.add(uses.split("/")[-1])
+            continue
+        permissions = job.get("permissions", workflow_permissions)
+        oidc = _permissions_grant_oidc(permissions)
+
+        environment = job.get("environment")
+        if isinstance(environment, dict):
+            environment = environment.get("name")
+        if environment is None:
+            if oidc:
+                oidc_without_environment.add(str(job_id))
+            continue
+        if not isinstance(environment, str) or "${{" in environment:
+            unresolved.append(
+                f"{path} job '{job_id}' names its environment dynamically"
+            )
+            continue
+        environments.add(environment)
+        if oidc:
+            oidc_environments.add(environment)
+
+    return _WorkflowFacts(
+        path=path,
+        steerable=frozenset(steerable),
+        reusable="workflow_call" in triggers,
+        calls=frozenset(calls),
+        environments=frozenset(environments),
+        oidc_environments=frozenset(oidc_environments),
+        oidc_without_environment=frozenset(oidc_without_environment),
+        unresolved=tuple(unresolved),
+    )
+
+
+def _effective_triggers(
+    facts: dict[str, _WorkflowFacts],
+) -> tuple[dict[str, frozenset[str]], frozenset[str]]:
+    """Resolve each workflow's steerable triggers, following `workflow_call`.
+
+    A reusable workflow's own `on:` says only that it is callable; what can
+    start it is whatever starts its callers. Callers within the repo are
+    followed to a fixpoint. A reusable workflow with no caller here is returned
+    as unreached — its callers may live in another repo, which this cannot
+    enumerate.
+    """
+    resolved = {path: f.steerable for path, f in facts.items()}
+    callers: dict[str, set[str]] = {path: set() for path in facts}
+    for path, f in facts.items():
+        for callee in f.calls:
+            if callee in callers:
+                callers[callee].add(path)
+
+    # Each pass only adds triggers and the vocabulary is finite, so this
+    # settles; the iteration bound keeps a cyclic `uses:` graph from looping.
+    for _ in range(len(facts) + 1):
+        changed = False
+        for path, sources in callers.items():
+            grown = (
+                resolved[path].union(*(resolved[s] for s in sources))
+                if sources
+                else resolved[path]
+            )
+            if grown != resolved[path]:
+                resolved[path] = grown
+                changed = True
+        if not changed:
+            break
+
+    unreached = frozenset(
+        path for path, f in facts.items() if f.reusable and not callers[path]
+    )
+    return resolved, unreached
+
+
+@dataclass(frozen=True)
+class _CredentialSurface:
+    """The repo's credential-spending surface, as read from its workflows."""
+
+    env_steerable: dict[str, frozenset[str]]
+    oidc_environments: frozenset[str]
+    # (workflow path, job id) pairs minting OIDC outside any environment
+    ungated_oidc: tuple[tuple[str, str], ...]
+    unresolved: tuple[str, ...]
+
+
+def _credential_surface(files: dict[str, str | None] | None) -> _CredentialSurface:
+    """Read the workflows into the facts the environment gates need.
+
+    An unreadable tree yields an empty surface that says so, rather than no
+    surface at all: the environment gates below still verify, and only the
+    parts that need the workflows report themselves unread.
+    """
+    if files is None:
+        return _CredentialSurface(
+            {},
+            frozenset(),
+            (),
+            (".github/workflows could not be read from the default branch",),
+        )
+
+    facts: dict[str, _WorkflowFacts] = {}
+    unresolved: list[str] = []
+    for path, text in sorted(files.items()):
+        if text is None:
+            unresolved.append(f"{path} could not be read")
+            continue
+        parsed = _parse_workflow(path, text)
+        facts[path] = parsed
+        unresolved.extend(parsed.unresolved)
+
+    resolved, unreached = _effective_triggers(facts)
+    env_steerable: dict[str, set[str]] = {}
+    oidc_environments: set[str] = set()
+    ungated_oidc: list[tuple[str, str]] = []
+    for path, f in facts.items():
+        for env in f.environments:
+            env_steerable.setdefault(env, set()).update(resolved[path])
+        oidc_environments |= f.oidc_environments
+        ungated_oidc.extend((path, job) for job in sorted(f.oidc_without_environment))
+        if path in unreached and f.environments:
+            unresolved.append(
+                f"{path} is only reachable via `workflow_call` from outside this repo"
+            )
+
+    return _CredentialSurface(
+        env_steerable={e: frozenset(t) for e, t in env_steerable.items()},
+        oidc_environments=frozenset(oidc_environments),
+        ungated_oidc=tuple(sorted(ungated_oidc)),
+        unresolved=tuple(sorted(set(unresolved))),
+    )
+
+
 def _reviewer_gate(env: dict, bot_name: str) -> str | None:
     """Why this environment's reviewer gate does not hold, or None if it does.
 
@@ -567,7 +857,12 @@ def _reviewer_gate(env: dict, bot_name: str) -> str | None:
 
 
 def _policy_gate(
-    repo: str, env_name: str, env: dict, admitted: list[str], tags_ok
+    repo: str,
+    env_name: str,
+    env: dict,
+    admitted: list[str],
+    tags_ok,
+    steerable: frozenset[str],
 ) -> str | None:
     """Why this environment's deployment policy does not gate the bot, or None.
 
@@ -576,6 +871,14 @@ def _policy_gate(
     ruleset (`tags_ok`, computed lazily since most repos have no tag entries).
     A pattern entry is refused rather than matched — deciding what a pattern
     covers would re-implement GitHub's matcher.
+
+    A ref-gated policy still loses to a trigger the bot fires and steers
+    itself (`steerable`), since the run starts from a ref the policy already
+    admits. Only the reviewer gate covers those. A workflow carrying such a
+    trigger counts even when an `if:` on the deploying job would skip that
+    event — reading the expression to decide otherwise is the same
+    re-implementation the pattern rule above declines, and the conservative
+    answer fails closed.
     """
     policy = env.get("deployment_branch_policy")
     if not policy:
@@ -600,28 +903,44 @@ def _policy_gate(
                 f"admits '{p['name']}', which tend has not verified the bot "
                 "cannot write"
             )
+    if steerable:
+        triggers = ", ".join(f"`{t}`" for t in sorted(steerable))
+        return (
+            f"admits only verified refs, but a workflow reaching it runs on "
+            f"{triggers}, which the bot fires and steers against a ref the "
+            "policy already admits"
+        )
     return None
 
 
-def check_secret_environments(
+def check_credential_environments(
     repo: str, cfg: Config, admitted: list[str]
 ) -> CheckResult:
-    """Every environment holding a secret is gated against the bot.
+    """Every environment holding a credential is gated against the bot.
 
-    A secret is released only to a job naming its environment, so the
+    A credential is released only to a job naming its environment, so the
     environment's own gate is the whole question — for release tokens exactly
     as for the operational secrets, which is what lets the security model
-    claim a run the bot can cause reads no secrets at all. A gate is a
+    claim a run the bot can cause reaches no credential at all. A gate is a
     required reviewer that is not the bot, or a deployment policy admitting
-    only refs verified out of the bot's reach (`_policy_gate`); either
-    suffices, since each alone stops the bot causing a run that the
-    environment feeds. `tend` itself is `check_environment`'s job.
+    only refs verified out of the bot's reach and carrying no trigger the bot
+    can steer (`_policy_gate`); either suffices, since each alone stops the
+    bot causing a run that the environment feeds. `tend` itself is
+    `check_environment`'s job.
 
-    Keyed on holding secrets rather than on any name, because a check that
-    reads names passes when an environment is renamed or a new one is stood
-    up beside it. An environment holding no secrets has nothing to gate.
+    An environment holds a credential when it stores a secret, or when a job
+    deploying to it requests `id-token: write` — trusted publishing (PyPI,
+    npm, a cloud role) stores no secret, and an environment sweep keyed on
+    stored secrets alone walks straight past the repos that publish. Keyed on
+    holding one rather than on any name, because a check that reads names
+    passes when an environment is renamed or a new one is stood up beside it.
+
+    `id-token: write` outside any environment is the ungated case of the same
+    thing: the minted token carries no environment claim, and nothing gates
+    the ref it comes from, so a trust policy pinning the repository but not
+    the ref accepts one the bot minted from a branch it pushed.
     """
-    name = "secret-environments"
+    name = "credential-environments"
 
     listed = _gh(
         "api",
@@ -637,6 +956,7 @@ def check_secret_environments(
             name, None, f"Could not list environments: {listed.stderr.strip()}"
         )
 
+    surface = _credential_surface(_fetch_workflow_files(repo))
     tags_ok = cache(lambda: _tags_admin_gated(repo, cfg.bot_name))
 
     ungated: list[str] = []
@@ -655,7 +975,7 @@ def check_secret_environments(
                 None,
                 f"Could not list secrets in '{env_name}' (requires admin access)",
             )
-        if not secrets.stdout.split():
+        if not secrets.stdout.split() and env_name not in surface.oidc_environments:
             continue
         holders.append(env_name)
         if env_name == TEND_ENVIRONMENT:
@@ -670,25 +990,47 @@ def check_secret_environments(
         reviewer_reason = _reviewer_gate(env, cfg.bot_name)
         if reviewer_reason is None:
             continue
-        policy_reason = _policy_gate(repo, env_name, env, admitted, tags_ok)
+        policy_reason = _policy_gate(
+            repo,
+            env_name,
+            env,
+            admitted,
+            tags_ok,
+            surface.env_steerable.get(env_name, frozenset()),
+        )
         if policy_reason is None:
             continue
         ungated.append(f"'{env_name}' {reviewer_reason}, and {policy_reason}")
+
+    if surface.ungated_oidc:
+        jobs = ", ".join(f"{path}:{job}" for path, job in surface.ungated_oidc)
+        ungated.append(
+            f"{len(surface.ungated_oidc)} job(s) request `id-token: write` outside "
+            "any environment, so nothing gates the ref the token is minted from "
+            f"({jobs})"
+        )
 
     if ungated:
         return CheckResult(
             name,
             False,
-            "An environment holding secrets is reachable by a run the bot can "
-            f"cause: {'; '.join(ungated)}. Gate each with a required reviewer "
-            "that is not the bot, or a deployment policy naming only verified "
-            "refs (protected branches, or tags under an admin-only all-tags "
-            "ruleset).",
+            "A run the bot can cause reaches a credential: "
+            f"{'; '.join(ungated)}. Gate each environment with a required "
+            "reviewer that is not the bot, or a deployment policy naming only "
+            "verified refs (protected branches, or tags under an admin-only "
+            "all-tags ruleset); move an OIDC job into such an environment.",
+        )
+    if surface.unresolved:
+        return CheckResult(
+            name,
+            None,
+            "Could not read the whole credential surface: "
+            f"{'; '.join(surface.unresolved)}",
         )
     if not holders:
-        return CheckResult(name, True, "No environment holds secrets")
+        return CheckResult(name, True, "No environment holds a credential")
     return CheckResult(
-        name, True, f"Secret-holding environments are gated: {', '.join(holders)}"
+        name, True, f"Credential-holding environments are gated: {', '.join(holders)}"
     )
 
 
@@ -1022,7 +1364,7 @@ def run_all_checks(cfg: Config, repo: str | None = None) -> list[CheckResult]:
     results.append(check_bot_permission(repo, cfg.bot_name))
     admitted = admitted_refs(results)
     results.append(check_environment(repo, admitted))
-    results.append(check_secret_environments(repo, cfg, admitted))
+    results.append(check_credential_environments(repo, cfg, admitted))
     results.append(check_secrets(repo, required_secrets))
     if cfg.harness == "claude":
         results.append(check_claude_auth(repo, cfg))
