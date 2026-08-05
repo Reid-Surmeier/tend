@@ -144,12 +144,12 @@ Scale depth to the change. A docs-only PR or a mechanical rename needs a skim fo
 
 Check the project's CLAUDE.md for language-specific review criteria and conventions. Load any project-specific review skill if available.
 
-Review the diff two ways at once: the manual checks below, plus a `/code-review` over it (Claude harness only; the Codex harness lacks the command, so skip it there). `/code-review` is a Claude Code built-in that reviews the working-tree diff (here, the PR's merged tree) for correctness bugs and cleanups. Scale its effort tier to how core the change is, the same way you scale the manual depth above:
+Review the diff two ways at once: the manual checks below, plus a `/tend-ci-runner:code-review` pass over the PR's merged tree. That skill is a structured second pass — correctness and cleanup angles, then a verify pass — and it returns findings rather than posting anything. Scale its depth to how core the change is, the same way you scale the manual depth above:
 
-- Peripheral or mechanical (docs, config, dependency bumps, test-only): `/code-review low` or `medium`.
-- The project's core logic: `/code-review high` or `max`.
+- Peripheral or mechanical (docs, config, dependency bumps, test-only): tell it the change is peripheral, so it runs the short angle set in one pass.
+- The project's core logic: tell it the change is core, so it fans the angles out and sweeps for gaps.
 
-What counts as core is repo-specific; let the project's own guidance (CLAUDE.md, a repo review skill) or your judgment decide. Skip `ultra` (the human-triggered cloud pass). Both passes feed one verdict: fold the `/code-review` findings into the review you submit in step 5, and don't pass `--comment` or `--fix`, which act outside the dedup and single-review path.
+What counts as core is repo-specific; let the project's own guidance (CLAUDE.md, a repo review skill) or your judgment decide. Both passes feed one verdict: fold its findings into the review you submit in step 5. It only reports back — it never posts a review, comment, or commit of its own, so the dedup and single-review path is preserved.
 
 **Code quality:**
 
