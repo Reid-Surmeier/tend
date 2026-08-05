@@ -704,6 +704,51 @@ def test_mention_verify_skips_bot_comments_without_mention(tmp_path: Path) -> No
     )
 
 
+def test_mention_verify_engagement_lookups_survive_pagination(
+    tmp_path: Path,
+) -> None:
+    """Engagement lookups must not reduce inside a `--paginate`d `--jq`.
+
+    `gh api --paginate` applies `--jq` once per page, so `--jq '[...] | length'`
+    emits one count per page instead of one overall. Past 100 records the
+    variable holds `100\\n7`, the `[ "$X" -gt "0" ]` guard below it errors with
+    `integer expression expected` and returns 2, and the failed test falls
+    through to should_run=false — the bot stops answering participants on
+    exactly the threads where it has engaged the most, with nothing going red.
+
+    Keep the filter a per-element stream, capture it bare, and test it for
+    emptiness. Reducing the stream through a pipe (`| wc -l`) would fix the
+    count but move the substitution's exit status off `gh`, so under the step's
+    default `bash -e` a failed API call would read as "no engagement" on a green
+    job — the same silent-quiet failure, relocated."""
+    cfg = Config.load(_minimal_config(tmp_path))
+    workflows = {wf.filename: wf for wf in generate_all(cfg)}
+    data = yaml.safe_load(workflows["tend-mention.yaml"].content)
+    check_step = next(
+        s for s in data["jobs"]["verify"]["steps"] if s.get("id") == "check"
+    )
+    run = check_step["run"]
+
+    # Every `--jq` under `--paginate` must stay a streaming filter. `--slurp` is
+    # not an escape hatch: `gh api` rejects it alongside `--jq`. Join
+    # backslash-continued lines first — the `--jq` sits on its own line.
+    for line in run.replace("\\\n", " ").splitlines():
+        if "--paginate" not in line or "--jq" not in line:
+            continue
+        assert "| length" not in line, (
+            f"reduction inside a --paginate'd --jq runs per page: {line.strip()}"
+        )
+
+    assert run.count("| .id')") == 3, (
+        "the three engagement lookups (issue comments, PR reviews, PR comments) "
+        "must capture the raw stream, so a failing `gh api` still trips errexit"
+    )
+    assert '-gt "0" ]' not in run, (
+        "guard on an empty stream (`[ -n ... ]`) — a numeric comparison is what "
+        "a split count breaks"
+    )
+
+
 def test_mention_verify_skips_self_authored_comments(tmp_path: Path) -> None:
     """The bot's own comments must not spin up a handle session.
 
