@@ -43,5 +43,5 @@ else
     "The bot failed to process a request. This issue tracks failures until the underlying cause is resolved." \
     "$ROW" \
     "This issue was created automatically. Close it once the outage is resolved." \
-    | run_issue_create_and_reconcile "$LABEL" "$TITLE" > /dev/null
+    | run_issue_create_and_reconcile "$LABEL" "$TITLE" "$ROW" > /dev/null
 fi
