@@ -239,7 +239,22 @@ case "$1" in
     ;;
   issue)
     case "$2" in
-      list) emit "$(cat "$PAUSE_ISSUES_JSON")" ;;
+      list)
+        # Fail the list calls in [FROM, UNTIL], so the spike block's two reads
+        # can be failed in any combination: FROM=1 alone fails both, FROM=2
+        # spares the first, and FROM=1 UNTIL=1 spares the re-read. UNTIL is
+        # unbounded by default, which keeps "the list is simply down" open
+        # ended rather than pinned to an exact call count.
+        if [ -n "${FAIL_ISSUE_LIST_FROM:-}" ]; then
+          n=$(( $(cat "$LIST_CALLS" 2>/dev/null || echo 0) + 1 ))
+          echo "$n" > "$LIST_CALLS"
+          if [ "$n" -ge "$FAIL_ISSUE_LIST_FROM" ] \
+            && { [ -z "${FAIL_ISSUE_LIST_UNTIL:-}" ] || [ "$n" -le "$FAIL_ISSUE_LIST_UNTIL" ]; }; then
+            exit 1
+          fi
+        fi
+        emit "$(cat "$PAUSE_ISSUES_JSON")"
+        ;;
       create)
         # An `if` rather than `[ ... ] && exit 1`: with nothing after it, the
         # failed test would become the branch's status and every create would
@@ -356,6 +371,7 @@ def rate_limit_env(tmp_path: Path) -> dict[str, str]:
     return {
         "PATH": f"{bindir}:{Path(jq).parent}:/usr/bin:/bin",
         "GH_CALLS": str(tmp_path / "gh-calls.log"),
+        "LIST_CALLS": str(tmp_path / "list-calls"),
         "TIMELINE_JSON": str(timeline),
         "PAUSE_ISSUES_JSON": str(pause_issues),
         "PROBE_ISSUES_JSON": str(probe_issues),
@@ -490,6 +506,78 @@ def test_rate_limit_keeps_its_annotation_when_the_row_cannot_be_appended(
 
     assert result.returncode == 1
     assert "Refused runs are listed in #42" in result.stdout
+
+
+def test_rate_limit_files_nothing_when_the_issue_list_cannot_be_read(
+    rate_limit_env: dict[str, str],
+) -> None:
+    """A failed list read must not be taken for "no issue exists".
+
+    Both readings are the empty string, and acting on the wrong one files a
+    second pause issue. The reconcile cannot merge that one away: it probes the
+    ten numbers under the issue it just filed, and an already-open pause issue
+    is normally far older. The duplicate then costs an approval outright — the
+    lookup resolves to the lowest-numbered issue, so a maintainer closing the
+    newer one, which is the issue this run's annotation names, approves nothing.
+    """
+    rate_limit_env["FAKE_TODAY_POSTS"] = "16"
+    # An issue is already open; the point is that this run cannot see it.
+    _approve(rate_limit_env)
+    rate_limit_env["FAIL_ISSUE_LIST_FROM"] = "1"
+
+    result = _run_preflight(rate_limit_env)
+
+    assert result.returncode == 1
+    calls = _calls(rate_limit_env)
+    assert not any(c.startswith("issue create") for c in calls), calls
+    assert "could not be read" in result.stdout
+    assert "could not be filed" not in result.stdout
+
+
+def test_rate_limit_still_files_when_only_the_re_read_fails(
+    rate_limit_env: dict[str, str],
+) -> None:
+    """A failed re-read must not suppress the file the first read cleared.
+
+    The two reads rule out different things. The first excludes an already-open
+    issue of any age, which is the duplicate worth avoiding; the re-read after
+    the jitter only narrows the seconds-wide sibling race, and the reconcile's
+    downward probe catches that anyway. Holding off here would pause the bot
+    with no issue at all — the outcome opening one exists to avoid — and point
+    the maintainer at an issue this run's own first read established isn't
+    there.
+    """
+    rate_limit_env["FAKE_TODAY_POSTS"] = "16"
+    # Nothing open, so the first read is a clean "none"; only the re-read fails.
+    rate_limit_env["FAIL_ISSUE_LIST_FROM"] = "2"
+
+    result = _run_preflight(rate_limit_env)
+
+    assert result.returncode == 1
+    assert any(c.startswith("issue create") for c in _calls(rate_limit_env))
+    assert "could not be read" not in result.stdout
+
+
+def test_rate_limit_files_when_only_the_first_read_fails(
+    rate_limit_env: dict[str, str],
+) -> None:
+    """The re-read's verdict counts when the first read never landed.
+
+    The mirror of the case above, and the reason the re-read raises the flag
+    rather than merely leaving it alone. Without that raise the run refuses,
+    files nothing, and points the maintainer at an open issue the re-read had
+    just established isn't there — the same dead end from the other side.
+    """
+    rate_limit_env["FAKE_TODAY_POSTS"] = "16"
+    # Only the first read fails; the re-read comes back clean and empty.
+    rate_limit_env["FAIL_ISSUE_LIST_FROM"] = "1"
+    rate_limit_env["FAIL_ISSUE_LIST_UNTIL"] = "1"
+
+    result = _run_preflight(rate_limit_env)
+
+    assert result.returncode == 1
+    assert any(c.startswith("issue create") for c in _calls(rate_limit_env))
+    assert "could not be read" not in result.stdout
 
 
 def test_rate_limit_human_close_doubles_the_ceiling(
@@ -817,7 +905,14 @@ emit() {
 
 case "$1 $2" in
   "api user") emit '{"login":"tend-agent","id":4242}' ;;
-  "issue list") emit "$(cat "$OPEN_ISSUES_JSON")" ;;
+  "issue list")
+    if [ -n "${FAIL_ISSUE_LIST_FROM:-}" ]; then
+      n=$(( $(cat "$LIST_CALLS" 2>/dev/null || echo 0) + 1 ))
+      echo "$n" > "$LIST_CALLS"
+      if [ "$n" -ge "$FAIL_ISSUE_LIST_FROM" ]; then exit 1; fi
+    fi
+    emit "$(cat "$OPEN_ISSUES_JSON")"
+    ;;
   "issue create") echo "https://github.com/owner/repo/issues/${FAKE_NEW_ISSUE}" ;;
   "issue view") emit "$(cat "$KEEPER_JSON")" ;;
   "issue comment") cat >> "$COMMENT_BODIES" ;;
@@ -859,6 +954,7 @@ def report_failure_env(tmp_path: Path) -> dict[str, str]:
     return {
         "PATH": f"{bindir}:{Path(jq).parent}:/usr/bin:/bin",
         "GH_CALLS": str(tmp_path / "gh-calls.log"),
+        "LIST_CALLS": str(tmp_path / "list-calls"),
         "OPEN_ISSUES_JSON": str(tmp_path / "open-issues.json"),
         "PROBE_ISSUES_JSON": str(tmp_path / "probe-issues.json"),
         "KEEPER_JSON": str(tmp_path / "keeper.json"),
@@ -914,6 +1010,29 @@ def test_report_failure_appends_to_the_open_tracker(
     assert not any(c.startswith("issue create") for c in calls), (
         f"filed a second tracker while one was open: {calls}"
     )
+
+
+def test_report_failure_files_nothing_when_the_issue_list_cannot_be_read(
+    report_failure_env: dict[str, str],
+) -> None:
+    """The same conflation, from the other caller.
+
+    Two open trackers is the state that breaks the drain sweep: later rows
+    scatter across both and neither carries the complete set. The reconcile's
+    downward probe does not reach an older tracker, so the duplicate persists.
+    Skipping costs this one row, and the next failure records normally.
+    """
+    Path(report_failure_env["OPEN_ISSUES_JSON"]).write_text(
+        json.dumps([{"number": 8, "title": OUTAGE_TITLE}])
+    )
+    report_failure_env["FAIL_ISSUE_LIST_FROM"] = "1"
+
+    result = _run_report_failure(report_failure_env)
+
+    assert result.returncode == 0, result.stderr
+    calls = _calls(report_failure_env)
+    assert not any(c.startswith("issue create") for c in calls), calls
+    assert "::warning::" in result.stdout
 
 
 def test_report_failure_carries_its_row_onto_the_racing_sibling(
