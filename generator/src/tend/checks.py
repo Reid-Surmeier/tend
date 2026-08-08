@@ -1111,9 +1111,11 @@ def check_credential_environments(
             False,
             "A run the bot can cause reaches a credential: "
             f"{'; '.join(ungated)}. Gate each environment with a required "
-            "reviewer that is not the bot, or a deployment policy naming only "
-            "verified refs (protected branches, or tags under an admin-only "
-            "all-tags ruleset); move an OIDC job into such an environment.",
+            "reviewer that is not the bot, or a deployment policy listing "
+            "only verified refs — branches this run confirmed the bot cannot "
+            "write, or tags under an admin-only all-tags ruleset; move an "
+            "OIDC job into such an environment. The policy's 'protected "
+            "branches' setting is not one of them.",
         )
     if surface.unresolved:
         return CheckResult(
