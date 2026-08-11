@@ -88,6 +88,8 @@ Corollary: don't background anything whose output gates the deliverable. If a fu
 
 A pushed fix isn't done until its required checks are terminal — see **CI Monitoring**.
 
+Your closing summary is the session's only durable record of what happened, and it is read later as if it were current. Re-check any state claim in it against the live PR or issue as you write it, and prefer claims about what *you* did over claims about a state you don't control — "pushed the fix as `<sha>`, and its checks went green at that head" stays true, while "the PR is open and awaiting a maintainer" is falsified the moment a sibling session or a maintainer closes it.
+
 ## Filing Issues in This Repo
 
 An issue here is not a note to a maintainer — where `tend-triage` is enabled (the default), it fires on `issues` and does the work. Filing one for a fix you have already scoped hands your own analysis to a second agent run, which re-derives it from your issue body and opens the PR minutes later at full session cost, on a thread nobody needed.
@@ -440,6 +442,20 @@ If any prior entry — from a human or another tend workflow — already address
 If the author resolved the issue, acknowledge it rather than post stale analysis. If new information contradicts the findings, update before posting.
 
 **A new entry may be a directive, not a duplicate.** The re-fetch above guards against redundant posts, but a comment that arrived while you worked can also be a maintainer follow-up that *changes the work* — a second instruction, a correction, a narrowed scope. The window is widest after a long edit→commit→push sequence: minutes pass between the session-start read and the post, and that gap is exactly when a maintainer adds to the thread. So the re-fetch isn't only a dedup check — read what landed, and if it's a new directive, fold it into the same run rather than shipping a reply (or a commit) against the stale instruction. Treating the task as done is itself a kind of post: re-fetch before ending the turn, not only before commenting.
+
+### A terminal action collides with branch state, not comments
+
+The re-fetch above counts comments and reviews, because that is what a duplicate *post* collides with. Closing a PR, reverting it, or force-pushing over it collides with **commits** instead, and a sibling session's pushed, CI-green commit is invisible to all three checks a session typically runs first: a comments-and-reviews re-fetch, the `state == OPEN` check under **Re-check PR state before pushing a follow-up commit**, and a re-read of the review bodies that prompted the action. `--delete-branch` turns that blind spot destructive — the branch ref goes and the commit survives only through the PR ref.
+
+So before `gh pr close`, a revert, or a force-push, re-read the branch itself rather than the thread:
+
+```bash
+gh pr view <N> --json headRefOid,commits,comments,reviews \
+  --jq '{head: .headRefOid, commits: [.commits[].oid],
+         comments: (.comments | length), reviews: (.reviews | length)}'
+```
+
+If the head moved past the SHA you last pushed, a sibling acted on this PR while you waited — read its commits before deciding. Usually it applied one of the remedies you were weighing, which changes what the close is *for*, not whether to close: a PR whose premise a review invalidated is still yours to withdraw, and the session holding the PR is the one that can. Say what the sibling landed and why the close stands anyway, so the thread reads as one decision instead of two contradictory ones, and drop `--delete-branch` so that work stays reachable.
 
 ### Dedup check for inline review comment replies
 
