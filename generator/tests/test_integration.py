@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import click.testing
 import pytest
-from tests import ACTION_VERSION
+from tests import ACTION_VERSION, BASH, tool_path
 from tests import _yaml as yaml
 from click.testing import CliRunner
 
@@ -567,12 +567,12 @@ def test_notifications_precheck_tolerates_transient_non_json(
     output_file = tmp_path / "gh_output"
     output_file.write_text("")
     env = {
-        "PATH": f"{bindir}:/usr/bin:/bin",
+        "PATH": tool_path(bindir),
         "GITHUB_OUTPUT": str(output_file),
         "GITHUB_REPOSITORY": "owner/repo",
     }
     result = subprocess.run(
-        ["bash", "-e", "-c", script],
+        [BASH, "-e", "-c", script],
         env=env,
         capture_output=True,
         text=True,

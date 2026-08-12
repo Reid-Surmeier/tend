@@ -11,11 +11,11 @@ Python suite, so the tests live here.
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+from tests import BASH, tool_path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MARK_NOTIFICATION_READ = REPO_ROOT / "shared" / "steps" / "mark-notification-read.sh"
@@ -63,7 +63,7 @@ def gh_env(tmp_path: Path) -> dict[str, str]:
     event.write_text(json.dumps({"issue": {"number": 7}}))
 
     return {
-        "PATH": f"{bindir}:/usr/bin:/bin",
+        "PATH": tool_path(bindir),
         "GH_CALLS": str(tmp_path / "gh-calls.log"),
         "GITHUB_EVENT_NAME": "issues",
         "GITHUB_EVENT_PATH": str(event),
@@ -78,7 +78,7 @@ def gh_env(tmp_path: Path) -> dict[str, str]:
 
 def _run(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(MARK_NOTIFICATION_READ)],
+        [BASH, str(MARK_NOTIFICATION_READ)],
         env=env,
         capture_output=True,
         text=True,
@@ -308,9 +308,9 @@ def _cancelled_stream(tmp_path: Path) -> Path:
 
 def _usage(tmp_path: Path, *, stream: Path | None, logs_dir: Path) -> dict[str, object]:
     result = subprocess.run(
-        ["bash", str(COMPUTE_TOKEN_USAGE)],
+        [BASH, str(COMPUTE_TOKEN_USAGE)],
         env={
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "PATH": tool_path(),
             "MODEL": "opus",
             "LOGS_DIR": str(logs_dir),
             "STREAM_JSON": str(stream) if stream else "",
@@ -688,10 +688,6 @@ def rate_limit_env(tmp_path: Path) -> dict[str, str]:
         tmp_path, gh=FAKE_GH_RATE_LIMIT, date=FAKE_DATE, sleep=FAKE_SLEEP
     )
 
-    # Both the fake gh and the script itself shell out to jq.
-    jq = shutil.which("jq")
-    assert jq, "jq is required for these tests"
-
     event = tmp_path / "event.json"
     event.write_text(json.dumps({"pull_request": {"number": 851}}))
 
@@ -706,7 +702,7 @@ def rate_limit_env(tmp_path: Path) -> dict[str, str]:
     (tmp_path / "comment-bodies.txt").write_text("")
 
     return {
-        "PATH": f"{bindir}:{Path(jq).parent}:/usr/bin:/bin",
+        "PATH": tool_path(bindir),
         "GH_CALLS": str(tmp_path / "gh-calls.log"),
         "LIST_CALLS": str(tmp_path / "list-calls"),
         "TIMELINE_JSON": str(timeline),
@@ -730,7 +726,7 @@ def rate_limit_env(tmp_path: Path) -> dict[str, str]:
 
 def _run_preflight(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(RATE_LIMIT_PREFLIGHT)],
+        [BASH, str(RATE_LIMIT_PREFLIGHT)],
         env=env,
         capture_output=True,
         text=True,
@@ -1248,7 +1244,7 @@ def gate_env(tmp_path: Path) -> dict[str, str]:
     status.write_text(json.dumps({"statuses": []}))
 
     return {
-        "PATH": f"{bindir}:/usr/bin:/bin",
+        "PATH": tool_path(bindir),
         "GH_CALLS": str(tmp_path / "gh-calls.log"),
         "GITHUB_OUTPUT": str(tmp_path / "output.txt"),
         "GITHUB_REPOSITORY": "owner/repo",
@@ -1262,7 +1258,7 @@ def gate_env(tmp_path: Path) -> dict[str, str]:
 def _run_gate(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     # `bash -e` mirrors the shell GitHub Actions gives a `run:` block.
     return subprocess.run(
-        ["bash", "-e", str(REVIEW_GATE)],
+        [BASH, "-e", str(REVIEW_GATE)],
         env=env,
         capture_output=True,
         text=True,
@@ -1454,10 +1450,6 @@ def notifications_env(tmp_path: Path) -> dict[str, str]:
         tmp_path, gh=FAKE_GH_NOTIFICATIONS, date=FAKE_DATE, sleep=FAKE_SLEEP
     )
 
-    # Both the fake gh and the script itself shell out to jq.
-    jq = shutil.which("jq")
-    assert jq, "jq is required for these tests"
-
     notifications = tmp_path / "notifications.json"
     notifications.write_text("[]")
     runs = tmp_path / "runs.json"
@@ -1468,7 +1460,7 @@ def notifications_env(tmp_path: Path) -> dict[str, str]:
     read_threads.write_text("")
 
     return {
-        "PATH": f"{bindir}:{Path(jq).parent}:/usr/bin:/bin",
+        "PATH": tool_path(bindir),
         "GH_CALLS": str(tmp_path / "gh-calls.log"),
         "FETCH_CALLS": str(tmp_path / "fetch-calls"),
         "READ_THREADS": str(read_threads),
@@ -1484,7 +1476,7 @@ def notifications_env(tmp_path: Path) -> dict[str, str]:
 def _run_check(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     # `bash -e` mirrors the shell GitHub Actions gives a `run:` block.
     return subprocess.run(
-        ["bash", "-e", str(NOTIFICATIONS_CHECK)],
+        [BASH, "-e", str(NOTIFICATIONS_CHECK)],
         env=env,
         capture_output=True,
         text=True,
@@ -1776,7 +1768,10 @@ case "$1 $2" in
         # the oldest 100 alone. Both go through `emit`, so a caller passing
         # `--jq` has its own filter applied to what it actually received.
         if [ -n "$slurp" ]; then
-          emit "$(jq -c '[_nwise(100)]' "$ISSUE_COMMENTS_JSON")"
+          # Sliced by index rather than with `_nwise`, which jq 1.8 dropped.
+          # An empty list still pages as `[[]]`, the shape real `gh` returns.
+          emit "$(jq -c '. as $a | [range(0; ([($a|length),1]|max); 100) | $a[.:.+100]]' \
+            "$ISSUE_COMMENTS_JSON")"
         else
           emit "$(jq -c '.[0:100]' "$ISSUE_COMMENTS_JSON")"
         fi
@@ -1805,9 +1800,6 @@ def report_failure_env(tmp_path: Path) -> dict[str, str]:
         path.write_text(body)
         path.chmod(0o755)
 
-    jq = shutil.which("jq")
-    assert jq, "jq is required for these tests"
-
     event = tmp_path / "event.json"
     event.write_text(json.dumps({"pull_request": {"number": 851}}))
     for name in ("open-issues.json", "probe-issues.json", "issue-comments.json"):
@@ -1816,7 +1808,7 @@ def report_failure_env(tmp_path: Path) -> dict[str, str]:
     (tmp_path / "comment-bodies.txt").write_text("")
 
     return {
-        "PATH": f"{bindir}:{Path(jq).parent}:/usr/bin:/bin",
+        "PATH": tool_path(bindir),
         "GH_CALLS": str(tmp_path / "gh-calls.log"),
         "LIST_CALLS": str(tmp_path / "list-calls"),
         "OPEN_ISSUES_JSON": str(tmp_path / "open-issues.json"),
@@ -1836,7 +1828,7 @@ def report_failure_env(tmp_path: Path) -> dict[str, str]:
 
 def _run_report_failure(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(REPORT_FAILURE)], env=env, capture_output=True, text=True
+        [BASH, str(REPORT_FAILURE)], env=env, capture_output=True, text=True
     )
 
 
@@ -2049,7 +2041,7 @@ def test_run_issue_reconcile_refuses_a_call_with_no_row(
     """
     result = subprocess.run(
         [
-            "bash",
+            BASH,
             "-c",
             f'. "{RUN_ISSUE_LIB}"'
             f"; run_issue_create_and_reconcile {OUTAGE_LABEL} {OUTAGE_TITLE!r}"
