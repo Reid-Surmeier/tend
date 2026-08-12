@@ -128,11 +128,30 @@ Never replace the body — prior entries contain per-run evidence needed for gat
 
 ## Step 1: Find recent runs
 
-List tend CI runs that completed in the past 24 hours (the cron runs daily):
+List tend CI runs that completed since the previous `review-runs` run (nominally 24 hours — the cron runs daily):
 
 ```bash
 REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
-SINCE=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+# Anchor on the predecessor's start: a `date -d '24 hours ago'` resolves when
+# the agent runs it, so the window opens after the predecessor started and
+# drops the band in between. Steps 2 and 4 re-read the anchor from the file
+# written below; shell variables don't survive between Bash tool calls.
+#
+# Derive the workflow id from this run rather than assuming the file name;
+# exclude this run, because a re-run attempt of it can already read as
+# completed and anchoring on itself collapses the window to zero.
+# `status=success` reaches past a predecessor that died before its census, so
+# that band still gets covered. Clamp a stale or missing anchor (an outage, or
+# a fresh repo with no predecessor) so the window can recover one skipped day
+# without pulling in a week — Step 5 dedups whatever a widened window sees
+# twice.
+WF_ID=$(gh api "repos/$REPO/actions/runs/$GITHUB_RUN_ID" --jq '.workflow_id')
+PREV_START=$(gh api "repos/$REPO/actions/workflows/$WF_ID/runs?status=success&per_page=10" \
+  --jq "[.workflow_runs[] | select(.id != ${GITHUB_RUN_ID:-0}) | .created_at] | max // empty")
+SINCE=${PREV_START:-$(date -u -d '25 hours ago' +%Y-%m-%dT%H:%M:%SZ)}
+FLOOR=$(date -u -d '49 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+if [[ "$SINCE" < "$FLOOR" ]]; then SINCE=$FLOOR; fi
+echo "$SINCE" > /tmp/review-runs-since
 # Add the repo's extra prefixes from its `running-tend` skill: any workflow
 # running the tend action is in scope, not just the generated `tend-*` ones.
 # Step 2 prices the same list.
@@ -144,15 +163,25 @@ SINCE=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
 # applying it per page is harmless.
 PREFIXES=("tend-")
 PREFIX_RE="^($(IFS='|'; echo "${PREFIXES[*]}"))"
+# Census on *completion*, which is the axis that tiles. A run created before
+# `$SINCE` may still have been in progress at the predecessor's census, so
+# `status=completed` dropped it there — filtering on `created` here would drop
+# it again and nobody would ever see it, and those are the long-running runs
+# Step 3 goes on to hunt. So over-fetch by `created` and filter on
+# `updated_at`, as `list-recent-runs.sh` does. The floor is a run's whole
+# lifetime, not its job cap: `created_at` starts at queue time, and a
+# `cancel-in-progress: false` group can hold a run queued for many hours
+# before its 6h of execution even begins.
+FETCH_FROM=$(date -u -d "$SINCE - 24 hours" +%Y-%m-%dT%H:%M:%SZ)
 for workflow in $(gh api --paginate repos/$REPO/actions/workflows --jq ".workflows[] | select(.name | test(\"$PREFIX_RE\")) | .id"); do
-  gh api --paginate "repos/$REPO/actions/workflows/$workflow/runs?created=>=$SINCE&status=completed&per_page=100" \
-    --jq '.workflow_runs[] | {databaseId: .id, conclusion, createdAt: .created_at, name: .name}'
+  gh api --paginate "repos/$REPO/actions/workflows/$workflow/runs?created=>=$FETCH_FROM&status=completed&per_page=100" \
+    --jq ".workflow_runs[] | select(.updated_at >= \"$SINCE\") | {databaseId: .id, conclusion, createdAt: .created_at, updatedAt: .updated_at, name: .name}"
 done
 ```
 
 If no runs found, report "no runs to review" and exit.
 
-Report the run census as the count this returns. Cross-check any workflow whose count lands on a round page boundary (30, 100) against `.total_count` before trusting it — a count that equals the page size is the signature of a page that was never followed.
+Report the run census as the count this returns. `.total_count` counts the wider `FETCH_FROM` fetch, so it bounds the census from above rather than matching it — but a census that lands on a round page boundary (30, 100) is still the signature of a page that was never followed, so check that one against `.total_count` before trusting it.
 
 Then, for each run ID from above, pull its jobs and classify them:
 
@@ -209,10 +238,15 @@ Close the issue once every row is drained (`gh issue close "$OUTAGE"`); one left
 Run the token report script to get per-run token counts:
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/scripts/token-report.sh" 24 > /tmp/token-report.json
+# Whole hours back to Step 1's anchor, rounded up so the whole band is priced.
+# A literal `24` reopens the gap Step 1 closed. The `cat` isn't optional: an
+# unset `$SINCE` makes `date -d ""` today's midnight, not an error.
+SINCE=$(cat /tmp/review-runs-since)
+HOURS=$(( ( $(date -u +%s) - $(date -u -d "$SINCE" +%s) + 3599 ) / 3600 ))
+"${CLAUDE_PLUGIN_ROOT}/scripts/token-report.sh" "$HOURS" > /tmp/token-report.json
 ```
 
-Pass the same extra prefixes Step 1 censuses, so the two steps agree on what the fleet is — the repo's `running-tend` skill is the source for both (e.g. `review-` for a `review-reviewers` workflow that uses the tend action but isn't named `tend-*`).
+Pass the same extra prefixes Step 1 censuses (after `$HOURS`, which the script reads as its first positional arg), so the two steps agree on what the fleet is — the repo's `running-tend` skill is the source for both (e.g. `review-` for a `review-reviewers` workflow that uses the tend action but isn't named `tend-*`).
 
 Include the totals and per-workflow breakdown in the summary (Step 7). Flag any runs with unusually high token usage for closer inspection in Step 3.
 
@@ -234,7 +268,10 @@ For each analyzed run, compare what the bot did against what happened next. The 
 mention, notifications, weekly, and review-reviewers runs get the same treatment: find the bot's output and check whether it was accepted.
 
 ```bash
-# Bot PR dispositions — merged or closed in the window
+# Bot PR dispositions — merged or closed in the window. Re-read Step 1's
+# anchor: unset here, an empty string compares less than every non-null
+# `closedAt` and the check silently stops being windowed at all.
+SINCE=$(cat /tmp/review-runs-since)
 gh pr list --author "$BOT_LOGIN" --state all --limit 200 --json number,title,state,closedAt \
   --jq '.[] | select(.closedAt > "'$SINCE'")'
 ```
