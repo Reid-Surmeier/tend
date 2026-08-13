@@ -25,7 +25,18 @@ Tend has Claude-powered workflows beyond the generated `tend-*` set:
 
 | Workflow | File | Schedule | Purpose |
 |----------|------|----------|---------|
-| `review-reviewers` | `review-reviewers.yaml` | `47 * * * *` | Hourly analysis of adopter repo sessions |
+| `review-reviewers` | `review-reviewers.yaml` | manual only (paused) | Outside-in analysis of adopter repo sessions |
+
+`review-reviewers` runs only on `workflow_dispatch` — dispatch it as a
+spot-check after a release, harness switch, or model bump, not on a cadence. The
+per-repo `tend-review-runs` carries the routine loop; the workflow file's header
+explains the pause.
+
+A dispatched run's window opens at the **previous successful `review-reviewers`
+run**, floored 6h back (`list-recent-runs.sh`). With no cron, dispatches usually
+sit further apart than that, so the floor is the normal case: the run covers the
+last 6h and warns on stderr that the rest is a coverage gap. Dispatch it within
+~6h of whatever you want it to see.
 
 These use the tend composite action and produce `claude-session-logs*` artifacts,
 but their names don't match the `tend-*` prefix that scripts filter on by

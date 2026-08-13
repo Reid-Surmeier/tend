@@ -1,6 +1,6 @@
 ---
 name: review-reviewers
-description: Hourly outcome-based analysis of tend's CI behavior — checks whether tend's outputs were accepted or rejected, escalating to session logs only when outcomes look wrong.
+description: Outcome-based analysis of tend's CI behavior — checks whether tend's outputs were accepted or rejected, escalating to session logs only when outcomes look wrong.
 argument-hint: "<owner/repo>"
 metadata:
   internal: true
@@ -8,7 +8,7 @@ metadata:
 
 # Review Reviewers
 
-Analyze tend's CI behavior on the target repo over the past hour. Focus on **outcomes** — what the bot produced publicly and whether it was accepted — rather than internal session mechanics. Create PRs or issues on tend when outcomes reveal behavioral problems.
+Analyze tend's CI behavior on the target repo over the window Step 1 returns. Focus on **outcomes** — what the bot produced publicly and whether it was accepted — rather than internal session mechanics. Create PRs or issues on tend when outcomes reveal behavioral problems.
 
 ## First steps
 
@@ -157,7 +157,7 @@ LAST_GIST_ID=$(gh api /gists --paginate \
 
 ### Recording below-threshold findings
 
-**Append a `## Run <RUN_ID>` heading every run**, even when no problem finding exceeded a gate threshold. For all-clear hours, record a single Low-evidence "all-clear" entry as the body — runs analyzed, outcomes checked, no concerning signals. The heading per run is the audit trail that prior runs read to count cumulative occurrences and confirm which hours were analyzed; missing entries leave gaps that erode gate evaluation across runs.
+**Append a `## Run <RUN_ID>` heading every run**, even when no problem finding exceeded a gate threshold. For an all-clear window, record a single Low-evidence "all-clear" entry as the body — window analyzed, runs and outcomes checked, no concerning signals. The heading per run is the audit trail that prior runs read to count cumulative occurrences and confirm which spans were analyzed; missing entries leave gaps that erode gate evaluation across runs.
 
 After applying the gates, write each run's new findings (format in `@review-gates.md`) to `/tmp/findings.md`, then append them to the gist's `findings.md`. Reuse the current content already fetched into `/tmp/current.md` in "Reading historical evidence", concatenate, and PATCH via the API (`--rawfile` preserves trailing newlines that command substitution would strip):
 
@@ -212,6 +212,8 @@ If empty, record the run as all-clear per "Recording below-threshold findings" a
 
 If the script printed a `WARNING:` on stderr, the list is known-incomplete — the window was clamped, no anchor was found, or a workflow hit the fetch limit. Record a coverage gap naming the missing span instead of an all-clear, whether or not the list came back empty; the next run's floor advances past that span regardless, so an unrecorded gap is never revisited. If the script *fails* (non-zero exit, e.g. a transient API error), re-run it once; if it fails again, record the window as a coverage gap the same way — this run still concludes green, so the next tick anchors on it and never revisits the span.
 
+**State the window you analyzed.** Its floor is the previous successful run of this workflow, or 6h back when that is older. This workflow is dispatch-only, so runs sit further apart than a cron's and the floor moves accordingly: scope every claim to it — "no problems since 08:12Z", never "no problems" — and say plainly when the run was dispatched to check on something that landed before it.
+
 ## Step 2: Survey outcomes via cheap subagent
 
 Spawn a cheap subagent to check outcomes across all runs from Step 1. The subagent does the token-heavy work of mapping runs to PRs/issues and checking acceptance signals.
@@ -245,7 +247,7 @@ Use a cheap subagent (e.g. Haiku / gpt-mini) and a prompt like:
 > done | jq -s add
 > ```
 >
-> Filter the comment calls on `created_at` at both ends. `since` is an `updated_at` floor with no ceiling, so unfiltered it also returns comments written days earlier and merely edited in the window, plus everything posted between the window end and now — this skill starts 20–40 min after its tick, so on a busy repo that is most windows. Those are rows the per-run walk was right not to reach, and a check that contradicts a correct walk every run stops being believed. Leave `CANDIDATES` unbounded above: `updated:` matches the PR's own `updated_at`, so a range drops any PR that got bot output inside the window and was touched after it, and over-inclusion in a candidate list costs nothing. `--limit 100` is load-bearing — `gh pr list` defaults to 30 and truncates silently.
+> Filter the comment calls on `created_at` at both ends. `since` is an `updated_at` floor with no ceiling, so unfiltered it also returns comments written days earlier and merely edited in the window, plus everything posted between the window end and now — the session's own runtime keeps that gap open, so on a busy repo it catches rows in most windows. Those are rows the per-run walk was right not to reach, and a check that contradicts a correct walk every run stops being believed. Leave `CANDIDATES` unbounded above: `updated:` matches the PR's own `updated_at`, so a range drops any PR that got bot output inside the window and was touched after it, and over-inclusion in a candidate list costs nothing. `--limit 100` is load-bearing — `gh pr list` defaults to 30 and truncates silently.
 >
 > The comment endpoints cover conversation and inline-review comments only; neither returns review submissions, and an empty-body `APPROVE` is `tend-review`'s most common output. Without the fourth count an approvals-only window reports `0, 0` and satisfies the gate below with two zeros carrying no signal. Report all four numbers at the top of your summary. If the sweep found in-window rows your per-run walk did not reach, the walk is wrong — re-map from the PR numbers the sweep found rather than reporting those runs as silent.
 >
@@ -268,7 +270,7 @@ Use a cheap subagent (e.g. Haiku / gpt-mini) and a prompt like:
 > - `tend-review`: `gh -R $ARGUMENTS run view <run-id> --json headBranch` → find PR via
 >   `gh -R $ARGUMENTS pr list --head <branch> --state all` → check bot reviews via
 >   `gh api repos/$ARGUMENTS/pulls/<pr>/reviews`
-> - `tend-notifications`: check for recent bot comments/issue-close events in the past hour
+> - `tend-notifications`: check for bot comments/issue-close events inside the window from Step 1
 > - `tend-mention`: map run to issue/PR from triggering comment, check for bot replies
 > - `tend-mention` on `repository_dispatch` (the relay path for review events): there is no triggering comment and `headBranch` is the default branch, so neither route above resolves it. Read the target off the `verify` job's log, where the step env block prints the relayed payload:
 >   ```bash
@@ -425,7 +427,7 @@ Search titles AND bodies for related keywords. Only comment on existing issues i
 
 **Prefer PRs over issues.** A PR with a clear description is immediately actionable.
 
-- **PR** (default): Branch `hourly/review-$GITHUB_RUN_ID-<target-repo-name>-<topic-slug>`, fix, commit, push, create with label `claude-behavior`. `$GITHUB_RUN_ID` alone is not a unique branch name: every matrix leg of a tick carries the same one, and a single leg may open two PRs (see the 2-PR limit below). The target's repo name (the part after the `/`) keeps two legs from racing the same ref; the topic slug keeps one leg's two PRs from doing the same. Lead the PR description with two or three sentences — problem, fix, verification — and put the full analysis (run ID, outcome evidence, root cause, **gate assessment** including historical evidence count) inside `<details>`. Don't also create a separate issue.
+- **PR** (default): Branch `review-reviewers/$GITHUB_RUN_ID-<target-repo-name>-<topic-slug>`, fix, commit, push, create with label `claude-behavior`. `$GITHUB_RUN_ID` alone is not a unique branch name: every matrix leg of a run carries the same one, and a single leg may open two PRs (see the 2-PR limit below). The target's repo name (the part after the `/`) keeps two legs from racing the same ref; the topic slug keeps one leg's two PRs from doing the same. Lead the PR description with two or three sentences — problem, fix, verification — and put the full analysis (run ID, outcome evidence, root cause, **gate assessment** including historical evidence count) inside `<details>`. Don't also create a separate issue.
 - **Issue** (fallback): Only for problems too large or ambiguous to fix directly. Include run ID, outcome evidence, root cause analysis.
 
 Group multiple findings by broad theme. **Limit to at most 2 PRs per run** — if you have more findings, pick the highest-confidence ones and record the rest in the evidence gist.
