@@ -168,7 +168,7 @@ both.
 
 | Pin | File | Rule |
 |---|---|---|
-| `claude_version` | `claude/action.yaml` | track latest |
+| `claude_version` | `claude/action.yaml` | track npm's `latest` dist-tag |
 | `mitmproxy_version` | `claude/action.yaml` | track latest |
 | `uv_version` | `claude/action.yaml` | move it with `mitmproxy_version` |
 | `codex_version` | `codex/action.yaml` | track latest; the surface job confirms the bump |
