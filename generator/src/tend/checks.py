@@ -10,7 +10,12 @@ outside the allowlist).
 Uses the `gh` CLI for GitHub API access. Checks degrade gracefully when
 gh is unavailable or the token lacks permission. Everything read here is
 readable with the bot's own write-scoped token, so the nightly run sees
-the same answers a maintainer does.
+the same answers a maintainer does — with one asymmetry: a ruleset's
+`bypass_actors` list is served only to repo admins, but every response
+carries `current_user_can_bypass`, GitHub's own evaluation of the caller
+against that list. A run as the bot reads its verdict there; a run as an
+admin reads the list; a token that is neither — or a failed read, or a
+listed principal tend cannot resolve — reports unknown.
 """
 
 from __future__ import annotations
@@ -214,10 +219,13 @@ def check_branch_protection(repo: str, branch: str, bot_name: str) -> CheckResul
             name,
             None,
             f"Branch '{branch}' is protected but could not verify that the bot "
-            "cannot bypass its rulesets — either they aren't readable with this "
-            "token, or a bypass actor names a principal tend cannot resolve: a "
-            "team, app, or deploy key, or any user if `bot_name` itself does not "
-            "resolve to an account. Check the bypass list manually.",
+            "cannot bypass its rulesets — a ruleset read failed, a bypass list "
+            "is withheld (a repo admin reads one; the bot's own run reads "
+            "GitHub's verdict on it without needing the list), or a bypass "
+            "actor names a principal tend cannot resolve: a team, app, or "
+            "deploy key, or any user if `bot_name` itself does not resolve to "
+            "an account. Re-run as the bot or an admin, or check the bypass "
+            "list manually.",
         )
 
     return CheckResult(
@@ -241,6 +249,25 @@ def _user_id(login: str) -> int | None:
         return int(result.stdout.strip())
     except ValueError:
         return None
+
+
+def _current_login() -> str | None:
+    """The login the token authenticates as, or None when that can't be read.
+
+    Uncached on purpose: a run makes at most a handful of these calls, and a
+    module-level cache would leak between tests that repatch `_gh`.
+    """
+    result = _gh("api", "user", "--jq", ".login")
+    if result is None or result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _same_login(a: str, b: str) -> bool:
+    """Casefolded equality is the identity test for logins — GitHub logins
+    are case-insensitive and the config takes whatever case the maintainer
+    typed."""
+    return a.casefold() == b.casefold()
 
 
 def _bypass_actors_above_bot(actors: list[dict] | None, bot_name: str) -> bool | None:
@@ -278,12 +305,32 @@ def _bypass_actors_above_bot(actors: list[dict] | None, bot_name: str) -> bool |
     return None if unresolved else True
 
 
-def _ruleset_blocks_bot(repo: str, ruleset_id: int, bot_name: str) -> bool | None:
-    """Whether a ruleset's bypass list keeps a write-access bot out.
+def _ruleset_keeps_bot_out(data: dict, bot_name: str) -> bool | None:
+    """Whether a fetched ruleset's bypass configuration keeps the bot out.
+
+    Every ruleset response carries `current_user_can_bypass` — GitHub's own
+    evaluation of the *caller* against the full bypass list, principals tend
+    can't resolve included. When the caller is the bot, that verdict is
+    exactly the question, so it outranks inferring from `bypass_actors`
+    (which the API withholds below repo admin, and which the inference reads
+    assuming the bot sits at write — wrong for a fixture bot that holds
+    admin). Any other caller's verdict says nothing about the bot, so the
+    actor-list inference is all that's left. Only "never" gates: a
+    `pull_requests_only` bypass is the merge path a branch restriction
+    exists to close.
+    """
+    if data.get("current_user_can_bypass") is not None:
+        login = _current_login()
+        if login is not None and _same_login(login, bot_name):
+            return data["current_user_can_bypass"] == "never"
+    return _bypass_actors_above_bot(data.get("bypass_actors"), bot_name)
+
+
+def _fetch_ruleset(repo: str, ruleset_id: int | str) -> dict | None:
+    """A ruleset's detail, or None when unreadable.
 
     The repo-scoped endpoint serves organization- and enterprise-sourced
-    rulesets too, so any applying ruleset can be fetched here. None when the
-    ruleset is unreadable or its bypass list unverifiable.
+    rulesets too, so any applying ruleset can be fetched here.
     """
     result = _gh("api", f"repos/{repo}/rulesets/{ruleset_id}")
     if result is None or result.returncode != 0:
@@ -294,7 +341,19 @@ def _ruleset_blocks_bot(repo: str, ruleset_id: int, bot_name: str) -> bool | Non
         return None
     if not isinstance(data, dict):
         return None
-    return _bypass_actors_above_bot(data.get("bypass_actors"), bot_name)
+    return data
+
+
+def _ruleset_blocks_bot(repo: str, ruleset_id: int, bot_name: str) -> bool | None:
+    """Whether a ruleset's bypass configuration keeps a write-access bot out.
+
+    None when the ruleset is unreadable or its bypass configuration
+    unverifiable.
+    """
+    data = _fetch_ruleset(repo, ruleset_id)
+    if data is None:
+        return None
+    return _ruleset_keeps_bot_out(data, bot_name)
 
 
 def _tags_admin_gated(repo: str, bot_name: str) -> bool | None:
@@ -302,11 +361,11 @@ def _tags_admin_gated(repo: str, bot_name: str) -> bool | None:
 
     True when a tag-target ruleset covers `~ALL` tags with nothing excluded,
     restricts `creation` and `update` (force-pushing an existing tag fires
-    `update`), and every bypass actor outranks write — the shape install-tend's
-    ref-protection step creates. Narrower patterns are not credited: deciding
-    whether a pattern set covers an environment policy's tag entries would
-    re-implement GitHub's matcher, and the recipe's rule is all-tags on
-    purpose.
+    `update`), and its bypass configuration keeps the bot out
+    (`_ruleset_keeps_bot_out`) — the shape install-tend's ref-protection step
+    creates. Narrower patterns are not credited: deciding whether a pattern
+    set covers an environment policy's tag entries would re-implement
+    GitHub's matcher, and the recipe's rule is all-tags on purpose.
     """
     listed = _gh(
         "api",
@@ -320,13 +379,8 @@ def _tags_admin_gated(repo: str, bot_name: str) -> bool | None:
 
     unresolved = False
     for ruleset_id in listed.stdout.split():
-        result = _gh("api", f"repos/{repo}/rulesets/{ruleset_id}")
-        if result is None or result.returncode != 0:
-            unresolved = True
-            continue
-        try:
-            data = json.loads(result.stdout)
-        except (json.JSONDecodeError, ValueError):
+        data = _fetch_ruleset(repo, ruleset_id)
+        if data is None:
             unresolved = True
             continue
         ref_name = data.get("conditions", {}).get("ref_name", {})
@@ -334,7 +388,7 @@ def _tags_admin_gated(repo: str, bot_name: str) -> bool | None:
             continue
         if not {"creation", "update"} <= {r.get("type") for r in data.get("rules", [])}:
             continue
-        verdict = _bypass_actors_above_bot(data.get("bypass_actors"), bot_name)
+        verdict = _ruleset_keeps_bot_out(data, bot_name)
         if verdict is True:
             return True
         unresolved = unresolved or verdict is None
@@ -1006,10 +1060,8 @@ def _reviewer_gate(env: dict, bot_name: str) -> str | None:
             "requires approval from a team, whose membership is not visible here"
             f" — confirm '{bot_name}' is not in it, or name individual reviewers"
         )
-    # GitHub logins are case-insensitive and the config takes whatever case the
-    # maintainer typed, so casefolded equality is the identity test.
     reviewers = [r["reviewer"]["login"] for r in entries]
-    if bot_name.casefold() in {login.casefold() for login in reviewers}:
+    if any(_same_login(login, bot_name) for login in reviewers):
         return f"lists the bot ('{bot_name}') as a reviewer, so it approves its own run"
     return None
 
@@ -1075,19 +1127,19 @@ def _policy_gate(
         if p.get("type") == "tag":
             gated = tags_ok()
             if gated is None:
-                # Every unread input lands here, not just a withheld bypass
-                # list: an unlistable `/rulesets`, a ruleset that won't fetch,
-                # a bypass actor naming a team, app, or deploy key, and a
-                # `User` actor left undecidable by an unresolvable `bot_name`
-                # are all None. So the message names the set rather than
-                # prescribing the admin re-run that settles only one of them.
+                # Every unread input lands here: a failed ruleset read, a
+                # withheld bypass list, and a bypass actor naming a principal
+                # tend cannot resolve are all None. The message names the
+                # set, folding in which identity settles each — the bot's
+                # own run reads GitHub's verdict on it (all but failed
+                # reads), an admin reads the list.
                 unverified = _Gap(
-                    "admits tags, and whether an all-tags ruleset gates them is "
-                    "unverifiable with this token — either the rulesets aren't "
-                    "readable, a bypass list is withheld (only a repo admin "
-                    "reads one), or a bypass actor names a principal tend "
-                    "cannot resolve: a team, app, or deploy key, or any user "
-                    "if `bot_name` itself does not resolve to an account",
+                    "admits tags, and whether an all-tags ruleset gates them "
+                    "is unverifiable with this token — a ruleset read "
+                    "failed, a bypass list is withheld (a repo admin reads "
+                    "one; the bot's own run reads GitHub's verdict on it "
+                    "without needing the list), or a bypass actor names a "
+                    "principal tend cannot resolve",
                     verified=False,
                 )
             elif gated is False:
