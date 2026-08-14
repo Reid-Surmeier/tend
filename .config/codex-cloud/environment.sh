@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKTRUNK_VERSION=0.73.0
+if ! command -v wt >/dev/null 2>&1 ||
+  [[ "$(wt --version)" != "wt v${WORKTRUNK_VERSION}" ]]; then
+  curl --proto '=https' --tlsv1.2 -LsSf \
+    "https://github.com/max-sixty/worktrunk/releases/download/v${WORKTRUNK_VERSION}/worktrunk-installer.sh" |
+    WORKTRUNK_UNMANAGED_INSTALL="$HOME/.local/bin" sh
+fi
+
+WORKTRUNK_PROJECT=$(wt config show --format json | jq -r '.project.identifier | @json')
+install -d "$HOME/.config/worktrunk"
+cat >"$HOME/.config/worktrunk/approvals.toml" <<EOF
+[projects.$WORKTRUNK_PROJECT]
+approved-commands = [
+  "wt step copy-ignored",
+  "cd site && npm install --prefer-offline --no-audit --no-fund",
+  "cd site && npm run dev -- --port {{ branch | hash_port }}",
+  "lsof -ti :{{ branch | hash_port }} -sTCP:LISTEN | xargs kill 2>/dev/null || true",
+  "uv run pytest {{ args }}",
+  "npm --prefix worker ci --prefer-offline --no-audit --no-fund",
+  "npm --prefix worker test",
+  "npm --prefix worker run typecheck",
+]
+EOF
+
+if [[ "$(wt config approvals list --format=json | jq -r '.state')" != approved ]]; then
+  echo "Worktrunk approvals do not cover .config/wt.toml" >&2
+  wt config approvals list >&2
+  exit 1
+fi
+
+uv sync --frozen
+npm ci --prefix site --prefer-offline --no-audit --no-fund
+npm ci --prefix worker --prefer-offline --no-audit --no-fund
+
+uv tool install pre-commit
