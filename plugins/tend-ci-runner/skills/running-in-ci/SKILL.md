@@ -407,6 +407,14 @@ gh api repos/{owner}/{repo}/pulls/{number} -X PATCH \
   -f title="new title" -F body=@/tmp/updated-body.md
 ```
 
+**A description describes the whole PR, not the increment this run reviewed.** Scope every behavior claim in it to the PR's merge base — not `LAST_REVIEW_SHA`, and not whatever range this run happened to diff:
+
+```bash
+gh pr diff <number>   # merge-base→head, whatever this session has checked out
+```
+
+On a long-lived branch those are different commits — nightly's rolling `tend/update-workflows` PR accumulates a release per run, so its head is several releases past its merge base — and a claim that is true of the last increment can be false of the PR. If you can only verify the increment, name the base the claim is against instead of writing it as a claim about the PR. Nothing downstream catches a wrong description: it never turns a check red, and each later run re-anchors one increment further out.
+
 ## Atomic PRs
 
 Split unrelated changes into separate PRs — one concern per PR. If one change could be reverted without affecting the other, they belong in separate PRs.
