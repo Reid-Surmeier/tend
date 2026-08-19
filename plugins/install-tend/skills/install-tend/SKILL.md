@@ -56,9 +56,9 @@ A preference a step needs (7a's auth mode, 10's bio stance) is asked at
 that step.
 
 Otherwise this is an install, including a resume of one that never finished
-(config present, later steps missing). Gather every preference in a single
-`AskUserQuestion` round, so the rest of the install stops only where a step
-genuinely needs the user. First generate three bot-name candidates from the
+(config present, later steps missing). Gather every preference at the
+Kickoff, so the rest of the install stops only where a step genuinely
+needs the user. First generate three bot-name candidates from the
 bare repo name (`<repo>-bot`, `<repo>-tend`, `tend-<repo>`) and check their
 availability in parallel:
 
@@ -69,7 +69,7 @@ done
 ```
 
 Also check whether the repo has a README (names in step 5) — it decides
-whether question 3 gets a badge option.
+whether the badge appears in question 3 and the customize follow-up.
 
 In the message alongside the questions, lay out the install: it targets
 `$REPO`, runs the section headings below as steps, and typically takes 5–10
@@ -80,7 +80,8 @@ commit (pushing waits for their go-ahead, step 11).
 Then one `AskUserQuestion` call with three questions. Answering it is the
 go-ahead — no separate "ready to start?" confirmation. Drop any question the
 user's request or an existing config already answers (a supplied bot name, a
-chosen harness); a fully specified request leaves nothing to ask, and is
+chosen harness; the auth mode a config-settled harness leaves open is asked
+at 7a, not here); a fully specified request leaves nothing to ask, and is
 itself the go-ahead.
 
 1. **Harness** — which model runs the bot and which credential it
@@ -98,25 +99,37 @@ itself the go-ahead.
    takes a custom name; check its availability before using it. The tool
    needs 2–4 options, so generate more candidates whenever fewer than two
    come back available.
-3. **Customize** (`multiSelect: true`) — the areas where the user wants a
-   non-default value, each option naming its default in its description.
-   Submitting with nothing selected accepts every default, the normal
-   case; phrase the question so an empty submission reads as intended,
-   e.g. "Anything to customize? Defaults apply to whatever you leave
-   unselected." Omit an
-   area that can't apply (no README → no badge option). The tool caps a
-   question at 4 options, so a new area means grouping, not appending.
-   - **Workflow config** — setup steps, workflow conditions, schedules, job
-     permissions/timeouts, env vars (default: no overrides)
-   - **Bot guidance overlay** — PR title format, labels, review routing,
-     target branch, nightly actions (default: a placeholder overlay)
-   - **README badge** — an olive-green "maintained with tend" badge
-     (default: added, matching the README's existing badge style)
-   - **Bot profile bio** — the stance line on the bot's profile (default:
-     "I triage issues and help maintain `<repo>`")
+3. **Defaults** — accept the default setup, or pick areas to change:
+   - **Accept all defaults** (recommended) — no workflow overrides, a
+     placeholder guidance overlay, the badge added, and the bot bio
+     "tend agent for `<owner>/<repo>`. I triage issues and help maintain
+     `<repo>`." Nothing is locked in: every default is an ordinary edit later
+     (`.config/tend.yaml`, the files the install writes) or a re-run of
+     this skill.
+   - **Customize…** — pick the areas in a follow-up question.
 
-Each selected area gets its follow-up at its step (1, 4, 5, 10); unselected
-areas apply the default without asking. Steps that can't be defaulted —
+A **Customize…** answer gets one more `AskUserQuestion`
+(`multiSelect: true`): which areas to change, defaults applying to
+whatever is left unselected (an empty submission included), each option
+naming its default in its description. Both the defaults description
+and this follow-up list only the areas still open — drop an area the
+user's request settles (the request, not the default, governs its step:
+"skip the badge" skips it), an area a previous run already applied, and
+an area that can't apply (no README → no badge option). The tool caps a
+question at 4 options, so a new area means grouping, not appending.
+
+- **Workflow config** — setup steps, workflow conditions, schedules, job
+  permissions/timeouts, env vars (default: no overrides)
+- **Bot guidance overlay** — PR title format, labels, review routing,
+  target branch, nightly actions (default: a placeholder overlay)
+- **README badge** — placement and style, or leaving it out (default:
+  added, matching the README's existing badge style)
+- **Bot profile bio** — the stance line on the bot's profile (default:
+  "tend agent for `<owner>/<repo>`. I triage issues and help maintain
+  `<repo>`.")
+
+Each area selected there is asked about at its step (1, 4, 5, 10); the
+rest apply the default without asking. Steps that can't be defaulted —
 migrating a release secret, naming environment reviewers, creating the bot
 account, approving OAuth — still interact when they arrive.
 
@@ -248,7 +261,13 @@ place. Classify each remaining secret and act now — don't defer:
     at token-creation time; the user completes it in the open tab, per
     Browser sessions.
   - **Manual** — user generates the token themselves on the registry's
-    site and pastes it back.
+    site and stores it themselves: hand over the environment's
+    `gh secret set` command fully substituted. With neither `--body` nor
+    a pipe it prompts for the value, so the token never sits in the chat
+    transcript. Don't delete the repo-level copy until
+    `gh secret list --repo "$REPO" --env "$ENV" --json name` shows it —
+    the write is theirs on this route, so nothing else tells the agent it
+    landed.
 
   Whichever route is chosen, include the exact token-creation URL in
   the question or option description (and in the follow-up message if
@@ -505,7 +524,9 @@ environment protection rules on top.
 
 Create `.claude/skills/running-tend/SKILL.md` with tend-specific project
 guidance. This skill is loaded by tend workflows alongside the generic
-`tend-*` skills.
+`tend-*` skills — by skill discovery, so it must open with the
+frontmatter shown below. An existing overlay without it isn't done:
+add the frontmatter in place.
 
 **Do NOT duplicate CLAUDE.md** and **do NOT invent project conventions.**
 
@@ -519,10 +540,15 @@ If the user picked the overlay at Kickoff, ask via `AskUserQuestion`
 - Optional nightly actions (e.g., changelog maintenance — specify file and branch)
 
 For each selected item, follow up with a free-text ask to capture the
-specifics, then write them into the overlay. Otherwise create a
-placeholder:
+specifics, then write them into the overlay, opening with the same
+frontmatter as the placeholder below. Otherwise create a placeholder:
 
 ```markdown
+---
+name: running-tend
+description: Project-specific guidance for tend workflows running on this repo.
+---
+
 No project-specific tend preferences yet. Add guidance here as
 needed — this file is loaded by tend workflows alongside CLAUDE.md.
 ```
@@ -556,7 +582,8 @@ markdown shape:
 [![maintained with tend](<image-url>)](https://github.com/max-sixty/tend)
 ```
 
-Wherever the badge comes up in chat (the Kickoff option, a follow-up),
+Wherever the badge comes up in chat (the Kickoff defaults description,
+the customize follow-up),
 describe it briefly ("an olive-green 'maintained with tend' badge with the
 tend wordmark") — do NOT paste the raw `img.shields.io` URL or its base64
 logo blob into the chat; the blob is hundreds of characters of noise.
@@ -607,6 +634,10 @@ install) can't be read back — GitHub secrets are write-only — so mint the
 value into the environment per the steps below, then delete the
 repo-level copy; `tend check` flags it until deleted.
 
+Where a path below has the user run `gh secret set` themselves, the step
+finishes when its pre-check prints SET — re-run it once they say they're
+done.
+
 Branch on the harness.
 
 ### 7a. Harness = claude
@@ -631,12 +662,17 @@ as 1-year), two mint paths, routed by environment rather than asked:
 - **CLI** — the default when `claude` is on PATH (`command -v claude`) and
   `uname` reports macOS or Linux; the bundled wrapper needs `python3` and a
   pty and has only been validated there, so `MINGW*`, `CYGWIN*`, `MSYS*`,
-  `Windows_NT`, etc. route to Manual. Run the wrapper, which invokes
-  `claude setup-token` (OAuth 2.0 PKCE, opens browser). **Run it in the
-  background:** it prints the
-  authorize URL to stderr and then waits, and one of the two ways it
-  finishes needs you to act while it is still running. Piping straight
-  into `gh` keeps the token out of the transcript.
+  `Windows_NT`, etc. route to Manual. The wrapper drives
+  `claude setup-token` (OAuth 2.0 PKCE) and prints only the token to
+  stdout, so piping straight into `gh` keeps it out of the transcript.
+
+  Launch the command below with the Bash tool's `run_in_background: true`
+  — a foreground call sits blocked with the URL trapped in its pending
+  result, and times out before the user has anything to click. Start it
+  only once the user says they are at the browser: the wrapper prints the
+  authorize URL within seconds, then waits — up to 15 minutes — for their
+  approval, and a run started ahead of them spends its window and takes
+  its own URL down.
 
   ```bash
   TOKEN=$("${CLAUDE_SKILL_DIR}/scripts/oauth_token.py" --code-file /tmp/tend-oauth-code)
@@ -644,17 +680,12 @@ as 1-year), two mint paths, routed by environment rather than asked:
     | gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo "$REPO" --env tend
   ```
 
-  The guard is load-bearing, and nothing writes the secret without it.
-  `gh secret set` stores empty stdin as an empty secret and exits 0, and
-  every check downstream reads names rather than values — `check_secrets`,
-  and this step's own pre-check above — so one failed run would leave a
-  `CLAUDE_CODE_OAUTH_TOKEN` that the next run reads as already set, skips,
-  and finishes green on.
-
-  Give the user the URL from stderr. Approving it either returns to the
-  CLI, which finishes the run on its own, or lands on a page showing a
-  `code#state` string. For the second, have them paste that string back
-  and write it to the same path — the wrapper types it into the prompt:
+  Read the task's output as it runs and hand the user the authorize URL
+  it prints. Approving it either returns to the CLI, which finishes the
+  run on its own, or lands on a page showing a `code#state` string. For
+  the second, have them paste that string back and write it to the
+  watched path while the task runs — the wrapper types it into the
+  prompt:
 
   ```bash
   printf '%s' '<code#state>' > /tmp/tend-oauth-code
@@ -663,22 +694,28 @@ as 1-year), two mint paths, routed by environment rather than asked:
   Each run generates a fresh PKCE challenge, so a code from an earlier
   run is dead; a restart needs a fresh approval.
 
-  The wrapper waits 15 minutes and then exits having written nothing, so
-  that window needs the user at the browser throughout it. The authorize
+  The window needs the user at the browser throughout it. The authorize
   URL logs the browser out on the way in
   (`claude.ai/login?reauth=1&from=logout`), which means an
   already-signed-in Claude session doesn't shorten the job, and the login
   in front of the approval is theirs — an agent driving Chrome reaches
-  that page and stops there. So start the run once they say they are at
-  the browser; one started ahead of them spends its window and takes its
-  own URL down. After a window lapses twice, stop reissuing and hand over
-  the Manual path, which has no window.
+  that page and stops there. After a window lapses twice, stop reissuing
+  and hand over the Manual path, which has no window.
+
+  When the task exits, its status alone says whether the secret was
+  stored: 0 stored it; anything else wrote nothing. The guard is
+  load-bearing for that — `gh secret set` stores empty stdin as an empty
+  secret and exits 0, and every check downstream reads names rather than
+  values (`check_secrets`, and this step's own pre-check above) — so one
+  unguarded failed run would leave a `CLAUDE_CODE_OAUTH_TOKEN` that the
+  next run reads as already set, skips, and finishes green on.
 
 - **Manual** — when the CLI path is unavailable, the wrapper errors out,
   or the user isn't at the browser when the agent is. Hand over both
   commands, fully substituted, for them to run in their own terminal (any
-  machine with Claude Code installed; `https://claude.com/claude-code` to
-  install it), whenever suits them:
+  machine with Claude Code installed and `gh` logged in as the
+  maintainer; `https://claude.com/claude-code` to install it), whenever
+  suits them:
 
   ```bash
   claude setup-token
@@ -706,8 +743,7 @@ gh secret set ANTHROPIC_API_KEY --repo "$REPO" --env tend
 
 ### 7b. Harness = codex
 
-Codex uses `OPENAI_API_KEY` (pay-per-token, from
-`https://platform.openai.com/api-keys`). The subscription `auth.json`
+Codex uses `OPENAI_API_KEY` (pay-per-token). The subscription `auth.json`
 path is not supported — Codex rotates that refresh token on every
 API call and invalidates the prior one, so tend's concurrent
 workflows (review/mention/triage/nightly/…) would break each other's
