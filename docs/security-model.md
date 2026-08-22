@@ -15,10 +15,11 @@ make unsophisticated attacks fail outright.
 Each adopting repo should document its specific configuration (admin accounts,
 token names, protected environments) in its own
 `.claude/skills/running-tend/SKILL.md`, the adopter-owned overlay the rest of
-the docs name. Not `.github/CLAUDE.md`: fork-PR instruction pinning covers root
-`CLAUDE.md` and `.claude/` under both harnesses (`shared/steps/restore-sensitive-config.sh`
-for Claude, `shared/steps/pin-instruction-files.sh` for Codex, which also pins every
-`AGENTS.md`), so notes parked outside those paths are read from the fork's own tree.
+the docs name. Not a `docs/agent-notes.md` of its own: fork-PR instruction
+pinning covers `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, and `.claude/` at
+any depth under both harnesses (`shared/steps/restore-sensitive-config.sh` for
+Claude, `shared/steps/pin-instruction-files.sh` for Codex), so notes parked
+outside those paths are read from the fork's own tree.
 
 ## Threats
 
@@ -287,14 +288,19 @@ SHA) bounds that trust to a reviewed, immutable point.
 
 **Config pinning.** The Claude harness actions restore RCE-relevant config from
 the PR base branch before the agent starts: `.claude/`, `.mcp.json`, `.claude.json`,
-`.gitmodules`, `.ripgreprc`, `.husky`, plus `CLAUDE.md`/`CLAUDE.local.md` as a
-prompt-injection defense. A malicious PR's `SessionStart` hook, MCP server, or
-injected `CLAUDE.md` is reverted before Claude reads it. The restoration runs
-in shell; the path list and ordering mirror claude-code-action's
-`restore-config.ts`. The PR-authored versions of those paths are snapshotted to
-`.claude-pr/` (added to `.git/info/exclude` so they're not tracked) before being
-overwritten, so review skills can optionally inspect what the PR changed without
-those files ever being executed.
+`.gitmodules`, `.ripgreprc`, `.husky` at the root, plus — as a prompt-injection
+defense — every `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, and `.claude/` at
+any depth, since Claude Code loads the instruction file nearest the file the
+agent opens and the skills under any directory's `.claude/`. A malicious PR's
+`SessionStart` hook, MCP server, or injected `CLAUDE.md` is reverted before
+Claude reads it. The restoration is `git restore --source=<base>` in shell:
+base-branch versions are written back, fork-added paths removed, and a
+fork-planted symlink replaced rather than written through. The root path list
+and ordering mirror claude-code-action's `restore-config.ts`. The PR's own
+versions stay readable at `git show HEAD:<path>` for a review that wants to see
+what it changed; nothing copies them into the worktree, since a copy made by
+the runner user would follow a fork-planted symlink into files the agent must
+never see, such as the checkout credential in `.git/config`.
 
 **Setup runs on reviewed code.** Adopter `setup:` steps execute as the runner
 user, which holds sudo and, until the sandbox setup strips it, the checkout
