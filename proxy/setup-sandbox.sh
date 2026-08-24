@@ -17,7 +17,7 @@
 #      agent step also points NODE_EXTRA_CA_CERTS at the exported PROXY_CA_CERT.)
 #
 # Exports for later steps via $GITHUB_ENV: SANDBOX, AGENT_HOME, PROXY_URL,
-# TEND_RUN_DIR, PROXY_CA_CERT, AGENT_ENV_FILE.
+# TEND_RUN_DIR, PROXY_CA_CERT, AGENT_ENV_FILE, AGENT_PATH.
 #
 # Inputs (env): TEND_GH_TOKEN (real PAT), TEND_ANTHROPIC_OAUTH_TOKEN and/or
 # TEND_ANTHROPIC_API_KEY (real Anthropic credential, injected for
@@ -80,8 +80,12 @@ log "user $SANDBOX uid=$(id -u "$SANDBOX")"
 sudo -u "$SANDBOX" mkdir -p "${AGENT_HOME}/.config/git"
 printf '/.claude/settings.local.json\n' \
   | sudo -u "$SANDBOX" tee "${AGENT_HOME}/.config/git/ignore" >/dev/null
+# `git -C` because this runs before step 3 grants the sandbox traversal of the
+# workspace: every sudo'd command inherits the runner's cwd there, and git stats
+# its cwd on startup whatever the command — under a 0750 /home/runner that is
+# `fatal: failed to stat`, exit 128, before the agent ever launches.
 sudo -u "$SANDBOX" env HOME="$AGENT_HOME" XDG_CONFIG_HOME="${AGENT_HOME}/.config" \
-  git config --global core.excludesFile "${AGENT_HOME}/.config/git/ignore"
+  git -C "$AGENT_HOME" config --global core.excludesFile "${AGENT_HOME}/.config/git/ignore"
 log "global gitignore at ${AGENT_HOME}/.config/git/ignore"
 
 # Decide the Anthropic auth scheme ONCE, here: unset the losing variable so
@@ -116,10 +120,19 @@ fi
 # TEND_SANDBOX_PATH — one dir per line). These are the adopter's explicit opt-in
 # and are prepended ahead of the auto-derived toolchains below (so their tools
 # win), with a leading `~` expanded to the sandbox home (the adopter doesn't
-# know the sandbox username). This is the durable lever for tools an adopter
-# installs at runtime in a `setup:` step (e.g. `cargo-nextest`): those land in
-# the runner's home, aren't seeded into /etc/skel, so the auto-derivation below
-# can't reach them — `sandbox_path: ["~/.cargo/bin"]` covers them.
+# know the sandbox username).
+#
+# What this lever reaches is what the sandbox can already open: a dir under the
+# sandbox home, or a system location (`/opt/hostedtoolcache/...`, where the
+# `setup-*` actions install). It does NOT reach a tool a `setup:` step installed
+# under the RUNNER's home — `cargo install`, `pip install --user`, an action
+# with its own install root. `~` there expands to the SANDBOX home, which has no
+# copy of it; naming the runner-home path instead would put a /home/runner entry
+# on the agent's PATH, which is the one thing the rewrite below exists to
+# prevent. `sandbox_setup:` covers that case — it runs as the sandbox user,
+# which can read a named world-readable file under the runner's home (step 3
+# grants o+x along that path) without the whole dir joining the agent's PATH.
+runner_home="${HOME:-/home/runner}"
 declare -a _extra_path=()
 if [ -n "${TEND_SANDBOX_PATH:-}" ]; then
   while IFS= read -r dir; do
@@ -128,6 +141,16 @@ if [ -n "${TEND_SANDBOX_PATH:-}" ]; then
     # tilde literally; they are not shell tilde expansion). SC2088 misreads this.
     # shellcheck disable=SC2088
     case "$dir" in "~") dir="$AGENT_HOME" ;; "~/"*) dir="${AGENT_HOME}/${dir#\~/}" ;; esac
+    # These entries are prepended verbatim, so they are the one way a
+    # runner-home dir could reach the agent's PATH — the rewrite below can't
+    # catch what never passes through it. Refuse rather than drop: the config
+    # asked for something this lever cannot do, and the fix is a different one.
+    case "$dir" in
+      "${runner_home}" | "${runner_home}"/*)
+        echo "::error::sandbox_path entry '${dir}' is under the runner's home, which the agent's PATH never includes. Install or copy the tool into the sandbox with sandbox_setup: instead."
+        exit 1
+        ;;
+    esac
     _extra_path+=("$dir")
   done <<<"$TEND_SANDBOX_PATH"
 fi
@@ -151,16 +174,17 @@ AGENT_ENV_FILE="${RUNNER_TEMP}/tend-agent-env"
 # runner-home root, so no /home/runner path ever reaches the sandbox PATH — and
 # the runner home is where the real credentials live. Do NOT relax that rewrite
 # trusting the `sudo -u "$SANDBOX" test -x` below as a backstop: it is not one.
-# Step 3 grants o+x on every ancestor of $GITHUB_WORKSPACE (which lives under the
-# runner home), so the sandbox UID can traverse /home/runner and `test -x` passes
-# for any world-executable dir beneath it. That test only filters nonexistent or
-# non-traversable dirs; an un-rewritten runner-home path would sail through it.
+# It happens to fail here only because step 3 hasn't run yet; step 3 grants o+x
+# on every ancestor of $GITHUB_WORKSPACE (which lives under the runner home), so
+# from then on the sandbox UID can traverse /home/runner and `test -x` passes for
+# any world-executable dir beneath it. Reorder anything and that test filters
+# nothing: an un-rewritten runner-home path would sail through it.
 #
 # (Tools an adopter installs at runtime in a `setup:` step land in the runner's
 # home, not /etc/skel, so they're absent from the sandbox home and this rewrite
-# finds nothing to point at — reaching those is what the `sandbox_path:` lever
-# above is for.)
-runner_home="${HOME:-/home/runner}"
+# finds nothing to point at. `sandbox_setup:` — which runs as the sandbox user —
+# is what installs those where the agent can reach them; sandbox-setup.sh names
+# whatever is still unreachable once it has run.)
 declare -A _seen_path=()
 declare -a _agent_path=()
 # Adopter-declared dirs win over everything, .local/bin included: prepend them
@@ -197,6 +221,11 @@ for _d in /usr/local/bin /usr/bin /bin; do
   _seen_path["${_d}"]=1
 done
 AGENT_PATH="$(IFS=:; printf '%s' "${_agent_path[*]}")"
+# The composed PATH, in the log: it is the only place the tilde expansion and
+# the runner-home rewrite are visible, and both are silent when they don't find
+# what an adopter expected. sandbox-setup.sh reports the consequence — which
+# commands the runner resolves and the agent can't — after sandbox_setup runs.
+log "sandbox PATH: ${AGENT_PATH}"
 cat >"$AGENT_ENV_FILE" <<EOF
 HOME=${AGENT_HOME}
 PATH=${AGENT_PATH}
@@ -266,6 +295,7 @@ fi
   echo "TEND_RUN_DIR=${TEND_RUN_DIR}"
   echo "PROXY_CA_CERT=${PROXY_CA_CERT}"
   echo "AGENT_ENV_FILE=${AGENT_ENV_FILE}"
+  echo "AGENT_PATH=${AGENT_PATH}"
 } >>"$GITHUB_ENV"
 
 # 2. Neutralize the credential actions/checkout persisted for git. Modern
