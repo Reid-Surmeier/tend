@@ -80,7 +80,11 @@ jobs:
           test -f "$confdir/mitmproxy-ca-cert.pem"
 
   # setup-sandbox.sh and sandbox-setup.sh need a second uid, sudo, and a runner
-  # PATH to derive from, so no Python test reaches them. This job runs both for
+  # PATH to derive from, so no Python test reaches them. Running them for real
+  # leaves the runner changed — checkout's persisted git credential deleted,
+  # o+x along the workspace's ancestors, the proxy CA in the system trust store,
+  # mitmdump still on 8899 — so a step added after these needs to expect that;
+  # only the workspace ownership is restored. This job runs both for
   # real, against the shape that hides a missing toolchain: a `setup:` step that
   # installs into the runner's own home (what `cargo install` and the install
   # actions do) with no sandbox lever set. Two things must hold — the sandbox
