@@ -329,8 +329,17 @@ host gets no token. The proxy itself is launched by a pinned `uv` that tend
 installs into its own directory, off `$PATH`, so the process holding both
 credentials starts from a known binary rather than whatever an adopter's
 `setup:` happened to leave on the runner. (`claude` is Node and ignores the
-system trust store, so it trusts the proxy CA via `NODE_EXTRA_CA_CERTS`.) The
-Codex harness (`codex/action.yaml`) still passes both the PAT and the model
+system trust store, so it trusts the proxy CA via `NODE_EXTRA_CA_CERTS`.) Shared
+system and hosted-toolcache PATH entries remain available to the sandbox. A
+runner-home PATH entry may select an independently seeded directory already
+owned by the sandbox user; runner-home files themselves stay off the sandbox
+PATH except for checkout paths. Tend does not infer which files under the
+runner home are runtimes rather than secrets; later home-scoped changes must be
+made as the sandbox user with `sandbox_setup:`. A generic failure shim keeps a
+dropped home-selected command from silently falling through to a different
+same-named system tool.
+
+The Codex harness (`codex/action.yaml`) still passes both the PAT and the model
 auth directly to the agent. The merge restriction and the environment gate
 remain the load-bearing boundaries regardless of harness.
 

@@ -17,7 +17,8 @@
 #      agent step also points NODE_EXTRA_CA_CERTS at the exported PROXY_CA_CERT.)
 #
 # Exports for later steps via $GITHUB_ENV: SANDBOX, AGENT_HOME, PROXY_URL,
-# TEND_RUN_DIR, PROXY_CA_CERT, AGENT_ENV_FILE, AGENT_PATH.
+# TEND_RUN_DIR, PROXY_CA_CERT, AGENT_ENV_FILE, AGENT_PATH,
+# TEND_BLOCKED_PATH.
 #
 # Inputs (env): TEND_GH_TOKEN (real PAT), TEND_ANTHROPIC_OAUTH_TOKEN and/or
 # TEND_ANTHROPIC_API_KEY (real Anthropic credential, injected for
@@ -31,6 +32,14 @@
 # rejected). TEND_SANDBOX_SETUP (commands) is consumed by the separate
 # shared/steps/sandbox-setup.sh step, not here.
 set -euo pipefail
+
+# Adopter setup actions intentionally mutate PATH; retain it as toolchain data,
+# but never resolve a privileged setup utility through it while real credentials
+# are in this process. The hosted image supplies every command this script uses
+# from these system directories.
+RUNNER_TOOL_PATH="${PATH}"
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 
 SANDBOX=tend-sandbox
 AGENT_HOME="/home/${SANDBOX}"
@@ -60,6 +69,16 @@ if [ -z "${MITMPROXY_VERSION:-}" ]; then
   echo "::error::MITMPROXY_VERSION is unset; the action must pin it"
   exit 1
 fi
+if [ -z "${GITHUB_WORKSPACE:-}" ] || [ ! -d "$GITHUB_WORKSPACE" ]; then
+  echo "::error::GITHUB_WORKSPACE must name the checked-out repository directory"
+  exit 1
+fi
+GITHUB_WORKSPACE=$(readlink -f -- "$GITHUB_WORKSPACE")
+if [ "$GITHUB_WORKSPACE" = / ]; then
+  echo "::error::GITHUB_WORKSPACE may not be the filesystem root"
+  exit 1
+fi
+export GITHUB_WORKSPACE
 
 # 1. Non-sudo sandbox user. -m gives it /home/tend-sandbox (0755, so the
 #    runner can still read the session logs it writes).
@@ -117,22 +136,11 @@ fi
 # through sudo into the sandbox — uv would then write its receipt/cache and any
 # XDG-aware tool its config under the runner's home, which the sandbox UID can't.
 # Adopter PATH additions (`sandbox_path:` in .config/tend.yaml, threaded in as
-# TEND_SANDBOX_PATH — one dir per line). These are the adopter's explicit opt-in
-# and are prepended ahead of the auto-derived toolchains below (so their tools
-# win), with a leading `~` expanded to the sandbox home (the adopter doesn't
-# know the sandbox username).
-#
-# What this lever reaches is what the sandbox can already open: a dir under the
-# sandbox home, or a system location (`/opt/hostedtoolcache/...`, where the
-# `setup-*` actions install). It does NOT reach a tool a `setup:` step installed
-# under the RUNNER's home — `cargo install`, `pip install --user`, an action
-# with its own install root. `~` there expands to the SANDBOX home, which has no
-# copy of it; naming the runner-home path instead would put a /home/runner entry
-# on the agent's PATH, which is the one thing the rewrite below exists to
-# prevent. `sandbox_setup:` covers that case — it runs as the sandbox user,
-# which can read a named world-readable file under the runner's home (step 3
-# grants o+x along that path) without the whole dir joining the agent's PATH.
-runner_home="${HOME:-/home/runner}"
+# TEND_SANDBOX_PATH — one dir per line). These are prepended ahead of the
+# runner's shared tool paths, with a leading `~` expanded to the sandbox home.
+# A runner-home source remains forbidden: unlike the checkout, that home can
+# contain credentials unrelated to the selected tool.
+runner_home=$(readlink -f -- "${HOME:-/home/runner}")
 declare -a _extra_path=()
 if [ -n "${TEND_SANDBOX_PATH:-}" ]; then
   while IFS= read -r dir; do
@@ -141,13 +149,14 @@ if [ -n "${TEND_SANDBOX_PATH:-}" ]; then
     # tilde literally; they are not shell tilde expansion). SC2088 misreads this.
     # shellcheck disable=SC2088
     case "$dir" in "~") dir="$AGENT_HOME" ;; "~/"*) dir="${AGENT_HOME}/${dir#\~/}" ;; esac
-    # These entries are prepended verbatim, so they are the one way a
-    # runner-home dir could reach the agent's PATH — the rewrite below can't
-    # catch what never passes through it. Refuse rather than drop: the config
+    # These entries are prepended verbatim, so they bypass the automatic PATH
+    # filter below. Refuse rather than drop: the config
     # asked for something this lever cannot do, and the fix is a different one.
-    case "$dir" in
+    resolved_dir=$(readlink -f -- "$dir" 2>/dev/null || true)
+    case "${resolved_dir:-$dir}" in
+      "${GITHUB_WORKSPACE}" | "${GITHUB_WORKSPACE}"/*) ;;
       "${runner_home}" | "${runner_home}"/*)
-        echo "::error::sandbox_path entry '${dir}' is under the runner's home, which the agent's PATH never includes. Install or copy the tool into the sandbox with sandbox_setup: instead."
+        echo "::error::sandbox_path entry '${dir}' is under the runner's home outside the checkout. Install the tool into the sandbox with sandbox_setup: instead."
         exit 1
         ;;
     esac
@@ -156,75 +165,126 @@ if [ -n "${TEND_SANDBOX_PATH:-}" ]; then
 fi
 
 AGENT_ENV_FILE="${RUNNER_TEMP}/tend-agent-env"
-# Derive the sandbox PATH from the runner's own PATH rather than hardcoding a
-# base set. setup-sandbox.sh runs as the privileged `runner` user, so $PATH
-# here already holds every toolchain dir the runner image put on PATH — the
-# /etc/skel-seeded language homes (.cargo/bin, .dotnet/tools, .config/composer/
-# vendor/bin, …) plus system dirs (/opt/pipx_bin, /usr/local/.ghcup/bin,
-# /usr/bin, …). `useradd -m` copied /etc/skel into the sandbox's OWN home, so
-# each runner-home toolchain has a sibling under ${AGENT_HOME}. We translate by
-# rewriting a leading ${runner_home} -> ${AGENT_HOME} and keeping the entry only
-# when it now exists and the sandbox UID can traverse it. This pulls every
-# seeded toolchain across with zero per-language code — cargo, dotnet, ghcup,
-# composer all arrive on the same rule, so there is no per-language allowlist to
-# grow.
-#
-# Security boundary: the `case` rewrite below is the SOLE credential boundary. It
-# maps every runner-home prefix to the sandbox's own copy and drops the bare
-# runner-home root, so no /home/runner path ever reaches the sandbox PATH — and
-# the runner home is where the real credentials live. Do NOT relax that rewrite
-# trusting the `sudo -u "$SANDBOX" test -x` below as a backstop: it is not one.
-# It happens to fail here only because step 3 hasn't run yet; step 3 grants o+x
-# on every ancestor of $GITHUB_WORKSPACE (which lives under the runner home), so
-# from then on the sandbox UID can traverse /home/runner and `test -x` passes for
-# any world-executable dir beneath it. Reorder anything and that test filters
-# nothing: an un-rewritten runner-home path would sail through it.
-#
-# (Tools an adopter installs at runtime in a `setup:` step land in the runner's
-# home, not /etc/skel, so they're absent from the sandbox home and this rewrite
-# finds nothing to point at. `sandbox_setup:` — which runs as the sandbox user —
-# is what installs those where the agent can reach them; sandbox-setup.sh names
-# whatever is still unreachable once it has run.)
-declare -A _seen_path=()
+# `setup:` actions that install into shared system or hosted-toolcache paths
+# work unchanged. A runner-home path uses an independently seeded counterpart
+# already present under the sandbox home; runner-home files themselves never
+# cross the UID boundary. Later home-scoped installs belong in `sandbox_setup:`.
+IFS=: read -ra _runner_path <<<"${RUNNER_TOOL_PATH}"
 declare -a _agent_path=()
-# Adopter-declared dirs win over everything, .local/bin included: prepend them
-# first and verbatim (trusted opt-in, so not existence-tested like the derived
-# entries below — the dir may be populated by a later `setup:` step) so an
-# adopter dir can shadow a same-named binary in .local/bin.
+declare -a _blocked_home_command=()
+_add_agent_path() {
+  local existing
+  for existing in "${_agent_path[@]}"; do
+    [ "$existing" = "$1" ] && return
+  done
+  _agent_path+=("$1")
+}
+_add_blocked_command() {
+  local existing
+  for existing in "${_blocked_home_command[@]}"; do
+    [ "$existing" = "$1" ] && return
+  done
+  _blocked_home_command+=("$1")
+}
+# Adopter-declared dirs are trusted opt-ins and may be populated later by
+# `sandbox_setup:`.
 for _d in ${_extra_path[@]+"${_extra_path[@]}"}; do
-  [ -n "${_seen_path[${_d}]:-}" ] && continue
-  _agent_path+=("${_d}")
-  _seen_path["${_d}"]=1
+  _add_agent_path "${_d}"
 done
-# .local/bin next, ahead of the auto-derived toolchains below.
-if [ -z "${_seen_path["${AGENT_HOME}/.local/bin"]:-}" ]; then
-  _agent_path+=("${AGENT_HOME}/.local/bin")
-  _seen_path["${AGENT_HOME}/.local/bin"]=1
-fi
-IFS=: read -ra _runner_path <<<"${PATH}"
+# .local/bin next, ahead of the runner's shared paths.
+_add_agent_path "${AGENT_HOME}/.local/bin"
+_agent_prefix_count=${#_agent_path[@]}
+declare -a _dropped_home_path=()
 for _d in "${_runner_path[@]}"; do
   [ -n "${_d}" ] || continue
-  case "${_d}" in
-    "${runner_home}") continue ;;                                     # never expose the runner home root
-    "${runner_home}"/*) _d="${AGENT_HOME}/${_d#"${runner_home}"/}" ;; # rewrite to the sandbox's own copy
+  _resolved_path=$(readlink -f -- "${_d}" 2>/dev/null) || continue
+  _drop_home=
+  case "${_resolved_path}" in
+    "${GITHUB_WORKSPACE}" | "${GITHUB_WORKSPACE}"/*)
+      _d="${_resolved_path}"
+      _shared_path=1
+      ;;
+    "${runner_home}")
+      _dropped_home_path+=("${_resolved_path}")
+      _drop_home=1
+      ;;
+    # This rewrite is the whole filter for runner-home entries. The later
+    # `test -x` is not a security backstop: it rejects /home/runner only before
+    # the workspace handoff grants traversal on the checkout's ancestors.
+    "${runner_home}"/*)
+      _sandbox_home_path="${AGENT_HOME}/${_resolved_path#"${runner_home}"/}"
+      if [ -d "${_sandbox_home_path}" ] && \
+         sudo -u "${SANDBOX}" test -x "${_sandbox_home_path}"; then
+        _d="${_sandbox_home_path}"
+        _shared_path=
+      else
+        _dropped_home_path+=("${_resolved_path}")
+        _drop_home=1
+      fi
+      ;;
+    *)
+      _d="${_resolved_path}"
+      _shared_path=
+      ;;
   esac
-  [ -n "${_seen_path[${_d}]:-}" ] && continue                           # dedup
-  if [ -d "${_d}" ] && sudo -u "${SANDBOX}" test -x "${_d}"; then
-    _agent_path+=("${_d}")
-    _seen_path["${_d}"]=1
+  # A command selected from the dropped home must not silently fall through to
+  # an older same-named command on a shared path. `type -P` answers from the
+  # captured runner PATH without executing adopter-controlled code.
+  if [ -n "${_drop_home}" ] && [ -d "${_resolved_path}" ] && \
+     [ -r "${_resolved_path}" ]; then
+    for _command_path in "${_resolved_path}"/*; do
+      [ -f "${_command_path}" ] && [ -x "${_command_path}" ] || continue
+      _command_name=${_command_path##*/}
+      _selected_command=$(PATH="$RUNNER_TOOL_PATH" type -P -- "${_command_name}" || true)
+      if [ -n "${_selected_command}" ] && \
+         [ "$(readlink -f -- "$(dirname -- "${_selected_command}")")" = \
+           "${_resolved_path}" ]; then
+        _add_blocked_command "${_command_name}"
+      fi
+    done
+  fi
+  [ -z "${_drop_home}" ] || continue
+  # The workspace becomes accessible at the ownership handoff below. Shared
+  # system/toolcache dirs must already be traversable by the sandbox uid.
+  if [ -n "${_shared_path}" ] || \
+     { [ -d "${_d}" ] && sudo -u "${SANDBOX}" test -x "${_d}"; }; then
+    _add_agent_path "${_d}"
   fi
 done
+if [ "${#_dropped_home_path[@]}" -gt 0 ]; then
+  log "runner-home PATH entries unavailable in sandbox: ${_dropped_home_path[*]}"
+  log "install any required home-scoped tools with sandbox_setup:"
+fi
 # Guarantee the base system dirs even if the runner PATH somehow lacks them.
 for _d in /usr/local/bin /usr/bin /bin; do
-  [ -n "${_seen_path[${_d}]:-}" ] && continue
-  _agent_path+=("${_d}")
-  _seen_path["${_d}"]=1
+  _add_agent_path "${_d}"
 done
+# Put generic failure shims after adopter paths and .local/bin, but before the
+# shared runner paths. `sandbox_setup:` can therefore replace a home-selected
+# command explicitly; otherwise invoking it fails instead of changing version.
+TEND_BLOCKED_PATH=
+if [ "${#_blocked_home_command[@]}" -gt 0 ]; then
+  TEND_BLOCKED_PATH="${AGENT_HOME}/.tend-blocked/bin"
+  sudo -u "$SANDBOX" mkdir -p "$TEND_BLOCKED_PATH"
+  printf '%s\n' '#!/bin/sh' \
+    'printf "tend: %s came from the runner home and is unavailable; install it into ~/.local/bin with sandbox_setup, or point sandbox_path at a copy outside the runner home\n" "${0##*/}" >&2' \
+    'exit 127' \
+    | sudo -u "$SANDBOX" tee "${TEND_BLOCKED_PATH%/bin}/unavailable" >/dev/null
+  sudo -u "$SANDBOX" chmod +x "${TEND_BLOCKED_PATH%/bin}/unavailable"
+  for _command_name in "${_blocked_home_command[@]}"; do
+    sudo -u "$SANDBOX" ln -sfn ../unavailable "${TEND_BLOCKED_PATH}/${_command_name}"
+  done
+  _agent_path=(
+    "${_agent_path[@]:0:${_agent_prefix_count}}"
+    "$TEND_BLOCKED_PATH"
+    "${_agent_path[@]:${_agent_prefix_count}}"
+  )
+  log "runner-home commands blocked from shared fallbacks: ${_blocked_home_command[*]}"
+fi
 AGENT_PATH="$(IFS=:; printf '%s' "${_agent_path[*]}")"
-# The composed PATH, in the log: it is the only place the tilde expansion and
-# the runner-home rewrite are visible, and both are silent when they don't find
-# what an adopter expected. sandbox-setup.sh reports the consequence — which
-# commands the runner resolves and the agent can't — after sandbox_setup runs.
+# The composed PATH is logged so sandbox_path expansion and dropped locations
+# are visible. sandbox-setup.sh reports missing commands after sandbox_setup
+# has had its chance to install them.
 log "sandbox PATH: ${AGENT_PATH}"
 cat >"$AGENT_ENV_FILE" <<EOF
 HOME=${AGENT_HOME}
@@ -296,6 +356,7 @@ fi
   echo "PROXY_CA_CERT=${PROXY_CA_CERT}"
   echo "AGENT_ENV_FILE=${AGENT_ENV_FILE}"
   echo "AGENT_PATH=${AGENT_PATH}"
+  echo "TEND_BLOCKED_PATH=${TEND_BLOCKED_PATH}"
 } >>"$GITHUB_ENV"
 
 # 2. Neutralize the credential actions/checkout persisted for git. Modern
