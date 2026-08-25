@@ -32,8 +32,9 @@
 # Exit codes:
 #   0  every gating check on <sha> settled green
 #   1  red — failing checks and their run URLs on stdout
-#   2  no usable rollup for <sha> — UNVERIFIED, not green. An unresolvable
-#      OID; an ephemeral merge-ref commit, which carries none; a commit with
+#   2  no usable rollup for <sha> — UNVERIFIED, not green. A <sha> that isn't
+#      a full 40-char lowercase OID, rejected at entry; an unresolvable OID; an
+#      ephemeral merge-ref commit, which carries none; a commit with
 #      zero checks and zero statuses (a push every workflow's paths filter
 #      excludes — the rollup is null then too, so "nothing to gate on" is
 #      indistinguishable from "nothing answered"); or a page walk that could
@@ -42,9 +43,31 @@
 
 set -euo pipefail
 
-PR="$1"
-SHA="$2"
+# Both default rather than relying on `set -u`: an omitted <sha> is the likelier
+# arity mistake, and unbound-variable death exits 1 — the code documented above
+# as red, sending the caller off to diagnose a CI failure that never happened.
+# Defaulting routes a short call into the guard below instead.
+PR="${1:-}"
+SHA="${2:-}"
 OWNER="${GITHUB_REPOSITORY%/*}"
+
+# GraphQL's `GitObjectID!` rejects an abbreviated OID at coercion time, which
+# rollup() cannot tell from a transient failure: without this the loop sleeps
+# through its whole budget before reporting a caller bug, and head_note's
+# string compare then claims the branch advanced to the very commit that was
+# passed in. Lowercase-only for the same reason from the other direction:
+# GraphQL coerces an uppercase OID happily, but head_note compares it against
+# `headRefOid`, which comes back lowercase — so an uppercase argument
+# mismatches its own commit and trails every verdict with that spurious note.
+# Nothing here emits uppercase (`git rev-parse` and `headRefOid` are both
+# lowercase), so rejecting it costs no real caller. head_note can still
+# misfire on the other exit-2 causes above — an unresolvable OID and a
+# merge-ref commit are both full-length and neither is the branch head — so
+# this narrows that note rather than fixing it.
+if [[ ! $SHA =~ ^[0-9a-f]{40}$ ]]; then
+  echo "poll-pr-checks.sh: <sha> must be a full 40-char lowercase commit OID, got '$SHA' — UNVERIFIED, not green" >&2
+  exit 2
+fi
 NAME="${GITHUB_REPOSITORY#*/}"
 
 # One query returns check runs *and* legacy status contexts, a page at a
