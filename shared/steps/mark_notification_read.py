@@ -12,9 +12,7 @@ Decisions this encodes:
 - Without ``run_started_at`` that comparison cannot be made, and marking
   unconditionally would swallow exactly the mid-run activity the guard exists
   to preserve — so a failed or absent timestamp skips this cycle and leaves
-  the thread to the scheduled poll. ``null`` counts as absent: it is not a
-  timestamp, and as a string every ISO-8601 stamp sorts before it, which would
-  make the guard match everything.
+  the thread to the scheduled poll.
 - The agent run already succeeded, so nothing here may fail the step: a
   transient API error warns and returns 0.
 - ``issue_comment`` fires for both issues and PR conversation comments, but a
@@ -35,10 +33,6 @@ from typing import Any
 
 import _common
 
-PULL_REQUEST_EVENTS = frozenset(
-    {"pull_request_target", "pull_request_review", "pull_request_review_comment"}
-)
-
 
 def subject_url(repo: str, event_name: str, event: Any) -> str | None:
     """The notification ``subject.url`` for the triggering event.
@@ -50,7 +44,11 @@ def subject_url(repo: str, event_name: str, event: Any) -> str | None:
     """
     if not isinstance(event, dict):
         return None
-    if event_name in PULL_REQUEST_EVENTS:
+    if event_name in (
+        "pull_request_target",
+        "pull_request_review",
+        "pull_request_review_comment",
+    ):
         section, kind = event.get("pull_request"), "pulls"
     elif event_name in ("issue_comment", "issues"):
         section = event.get("issue")
@@ -110,12 +108,11 @@ def main() -> int:
 
     run_id = env["GITHUB_RUN_ID"]
     try:
-        run_started_at = _common.gh(
-            "api", f"repos/{repo}/actions/runs/{run_id}", "--jq", ".run_started_at"
-        ).strip()
-    except subprocess.CalledProcessError:
-        run_started_at = ""
-    if not run_started_at or run_started_at == "null":
+        run = _common.gh_json("api", f"repos/{repo}/actions/runs/{run_id}")
+    except _common.GH_READ_FAILED:
+        run = None
+    run_started_at = run.get("run_started_at") if isinstance(run, dict) else None
+    if not isinstance(run_started_at, str) or not run_started_at:
         _common.annotate(
             "warning",
             "Could not read run_started_at; leaving notification unread (non-fatal)",
@@ -126,7 +123,7 @@ def main() -> int:
     # the inbox, is the same non-fatal outcome: warn and leave the thread.
     try:
         notifications = _common.gh_json("api", "notifications")
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
+    except _common.GH_READ_FAILED:
         notifications = None
     if not isinstance(notifications, list):
         _common.annotate("warning", "Failed to mark notification as read (non-fatal)")

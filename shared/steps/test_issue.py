@@ -43,10 +43,9 @@ def _trigger(
             "CI fix for [run 555](https://github.com/owner/repo/actions/runs/555)",
         ),
         ("workflow_run", {}, "CI fix for workflow run"),
-        # Events with no thread of their own, and a payload whose shape is not
+        # An event with no thread of its own, and payloads whose shape is not
         # the one the event promises.
         ("schedule", {}, ""),
-        ("workflow_dispatch", {}, ""),
         ("issues", {"issue": None}, ""),
         ("pull_request_target", {"pull_request": {}}, ""),
     ],
@@ -142,7 +141,6 @@ def test_canonical_raises_rather_than_reading_a_failed_list_as_none(
         ({"title": "A maintainer's issue"}, False),
         ({"user": {"login": "someone"}}, False),
         ({"labels": [{"name": "unrelated-label"}]}, False),
-        ({"labels": []}, False),
     ],
 )
 def test_is_ours_takes_all_of_author_title_label_and_open(

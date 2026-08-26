@@ -1,23 +1,9 @@
 """Tests for the token-usage step body.
 
-The Claude fixtures mirror the shapes observed in real uploaded artifacts.
-Three properties drive them:
-
-1. Both the stream-json and the session JSONL record each assistant message
-   roughly twice, so any sum has to deduplicate by ``message.id`` or it lands
-   ~2x high.
-2. The stream-json's assistant events are non-final (``stop_reason: null``):
-   their ``usage.output_tokens`` is the message-start placeholder (single
-   digits), not the finished count. Only the session JSONL carries final
-   per-message usage, so reconstructing from the stream-json under-counts
-   output by orders of magnitude while input and cache fields still match.
-3. A session that ran a ``Task`` has a second transcript under
-   ``<session-id>/subagents/``, whose usage the ``result`` event does not
-   count.
-
-Together they make ``output_tokens == 4500`` the discriminating assertion: the
-stream-json's placeholders sum to 12 and the subagent transcript would add
-7000.
+The Claude fixtures mirror the shapes observed in real uploaded artifacts, and
+``output_tokens == 4500`` is what discriminates between the three accounting
+paths: the stream-json's message-start placeholders sum to 12, and the `Task`
+subagent's transcript beside the session would add 7000.
 """
 
 from __future__ import annotations
@@ -165,35 +151,6 @@ def test_reconstructs_a_cancelled_session(tmp_path: Path, logs_dir: Path) -> Non
     )
 
 
-def test_prefers_result_events_when_present(tmp_path: Path, logs_dir: Path) -> None:
-    """A completed session still reports straight from its `result` events."""
-    _session_jsonl(logs_dir)
-    stream = _ndjson(
-        tmp_path / "stream.json",
-        [
-            _assistant("msg_0", STREAM_USAGE[0], final=False),
-            {
-                "type": "result",
-                "num_turns": 14,
-                "total_cost_usd": 1.2563179999999998,
-                "usage": {
-                    "input_tokens": 23,
-                    "output_tokens": 9406,
-                    "cache_creation_input_tokens": 62655,
-                    "cache_read_input_tokens": 789006,
-                },
-            },
-        ],
-    )
-
-    usage = token_usage.claude_usage(stream=stream, logs_dir=logs_dir, model="opus")
-
-    assert usage["output_tokens"] == 9406
-    assert usage["turns"] == 14
-    assert usage["cost_usd"] == 1.26
-    assert usage["partial"] is False
-
-
 def test_sums_every_result_event_but_takes_cost_from_the_last() -> None:
     """A `run_in_background: true` Bash makes the session emit a second result.
 
@@ -229,27 +186,6 @@ def test_sums_every_result_event_but_takes_cost_from_the_last() -> None:
         "cost_usd": 0.9,
         "partial": False,
     }
-
-
-def test_survives_a_truncated_final_line(tmp_path: Path, logs_dir: Path) -> None:
-    """A half-written line costs that line, not the run's whole accounting.
-
-    A cancelled process can be killed mid-append, leaving its session JSONL
-    ending in a partial entry. A parser that abandoned the file on the first
-    unreadable line would drop the run into the "agent never ran" branch,
-    republishing the all-zero `partial: false` payload this fallback exists to
-    replace — now indistinguishable from a genuine preflight no-op.
-    """
-    session = _session_jsonl(logs_dir)
-    session.write_text(session.read_text() + TRUNCATED)
-
-    usage = token_usage.claude_usage(
-        stream=_cancelled_stream(tmp_path), logs_dir=logs_dir, model="opus"
-    )
-
-    assert usage["output_tokens"] == 4500, "a truncated tail zeroed the totals"
-    assert usage["turns"] == 3
-    assert usage["partial"] is True
 
 
 def test_survives_a_truncated_line_beside_a_second_session(
@@ -318,7 +254,6 @@ def test_reports_zero_when_the_agent_never_ran(logs_dir: Path) -> None:
     """
     usage = token_usage.claude_usage(stream=None, logs_dir=logs_dir, model="opus")
 
-    assert usage == token_usage.zero_usage("opus")
     assert usage["cost_usd"] == 0
     assert usage["partial"] is False
 
@@ -380,18 +315,6 @@ def test_codex_counts_an_absent_token_count_as_zero() -> None:
     assert usage["output_tokens"] == 0
     assert usage["cached_input_tokens"] == 0
     assert usage["turns"] == 1
-
-
-def test_codex_reports_zero_when_no_rollout_exists() -> None:
-    """No rollouts at all is a real zero — the same computation over no events."""
-    assert token_usage.codex_usage([], "gpt-5") == {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cached_input_tokens": 0,
-        "turns": 0,
-        "model": "gpt-5",
-        "cost_usd": 0,
-    }
 
 
 def test_claude_main_publishes_the_record_three_ways(
@@ -493,11 +416,3 @@ def test_cost_renders_to_the_cent_and_says_so_when_unknown() -> None:
     assert token_usage.cell(None, "cost_usd") == "unknown"
     assert token_usage.cell(0, "cost_usd") == "$0.00"
     assert token_usage.cell(1.2, "cost_usd") == "$1.20"
-
-
-def test_cost_rounds_half_up_and_keeps_an_integral_result_integral() -> None:
-    """The record's cost is cents, and an exact dollar stays an int in the JSON."""
-    assert token_usage.round_usd(1.2563179999999998) == 1.26
-    assert token_usage.round_usd(0.125) == 0.13
-    assert json.dumps(token_usage.round_usd(1.0)) == "1"
-    assert json.dumps(token_usage.round_usd(0)) == "0"

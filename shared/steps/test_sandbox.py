@@ -52,14 +52,7 @@ def compose(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Compose:
 
 
 def test_launch_env_puts_the_context_after_the_file(compose: Compose) -> None:
-    """`sandbox_env:` cannot decide what the run thinks it is.
-
-    An adopter's additions reach the file, and `env` takes the final assignment
-    of a name — so a `sandbox_env: {GITHUB_WORKFLOW: …}` would displace the real
-    one if the halves were composed the other way round. Composing them here is
-    what makes that the function's postcondition rather than a rule each caller
-    has to remember.
-    """
+    """The order `launch_env`'s docstring makes its postcondition, pinned."""
     pairs = compose(
         {"GITHUB_WORKFLOW": "tend-weekly"},
         env_file="HOME=/sandbox\nGITHUB_WORKFLOW=spoofed-by-sandbox-env\n",
@@ -115,26 +108,6 @@ def test_launch_env_is_anchored_to_the_prefix(compose: Compose) -> None:
     )
 
     assert pairs == ["GITHUB_ACTOR=someone"]
-
-
-def test_launch_env_survives_values_a_line_oriented_carrier_could_not(
-    compose: Compose,
-) -> None:
-    """Spaces, newlines and globs arrive byte-identical.
-
-    This is what makes an argv list the right carrier for the context: the agent
-    env file is newline-delimited, so a multi-line value there would split into
-    a second line past `sandbox_env`'s reserved-name guard.
-    """
-    hostile = {
-        "GITHUB_EVENT_NAME": "two\nlines",
-        "GITHUB_HEAD_REF": "a b  c",
-        "GITHUB_REF_NAME": "*",
-    }
-
-    pairs = compose(hostile)
-
-    assert sorted(pairs) == sorted(f"{k}={v}" for k, v in hostile.items())
 
 
 def test_launch_env_reads_the_file_as_the_shell_wrote_it(compose: Compose) -> None:

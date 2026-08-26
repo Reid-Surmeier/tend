@@ -41,7 +41,7 @@ import random
 import subprocess
 import time
 from datetime import datetime, timedelta
-from typing import Any, NamedTuple
+from typing import Any
 
 import _common
 import _issue
@@ -79,19 +79,6 @@ with `gh run rerun <id> --failed` once this is closed.
 
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 _DAY = "%Y-%m-%d"
-
-
-class Filing(NamedTuple):
-    """How far filing the pause issue got — what the annotation can offer.
-
-    Three facts rather than one, and they must not be collapsed: saying "could
-    not be filed" about an issue that *was* filed sends a maintainer away from
-    the one thing that would restart the bot.
-    """
-
-    lookup_ok: bool
-    filed: bool
-    number: int | None
 
 
 def main() -> int:
@@ -209,8 +196,8 @@ def main() -> int:
             if abort:
                 _common.annotate("error", f"{headline}.")
             else:
-                filing = _file_pause_issue(_issue.row(), pause, lookup_ok)
-                _common.annotate("error", f"{headline}. {recovery(filing)}")
+                recovery = _file_pause_issue(_issue.row(), pause, lookup_ok)
+                _common.annotate("error", f"{headline}. {recovery}")
             abort = True
 
     if abort:
@@ -294,37 +281,6 @@ def count_approvals(
     return sum(1 for event in events if _is_approval(event, bot_id=bot_id, since=since))
 
 
-def recovery(filing: Filing) -> str:
-    """The recovery sentence the refusal annotation ends with."""
-    if not filing.lookup_ok:
-        # Nothing was filed, and the reason is the read rather than the write
-        # — so unlike the next branch, an issue may well be open and worth
-        # closing, this run just never managed to see it. Naming the label is
-        # all it can offer toward it.
-        return (
-            "This repo's issues could not be read (see the error above), so none was "
-            f"filed; if an open `{PAUSE_LABEL}` issue exists, closing it doubles the "
-            "ceiling."
-        )
-    if not filing.filed:
-        return (
-            "The pause issue could not be filed (see the error above), so there is "
-            "nothing to close and the ceiling holds until the UTC rollover."
-        )
-    if filing.number is not None:
-        return (
-            f"Refused runs are listed in #{filing.number}; closing it doubles the "
-            "ceiling."
-        )
-    # Filed, but no number came back: `gh issue create` printed something
-    # other than an issue URL. The label points at the same issue just as
-    # uniquely, where naming `#` would point at nothing.
-    return (
-        f"Refused runs are listed in the open `{PAUSE_LABEL}` issue; closing it "
-        "doubles the ceiling."
-    )
-
-
 def _is_approval(event: dict[str, Any], *, bot_id: int, since: str) -> bool:
     if event.get("event") != "closed":
         return False
@@ -334,8 +290,15 @@ def _is_approval(event: dict[str, Any], *, bot_id: int, since: str) -> bool:
     return (event.get("created_at") or "") > since
 
 
-def _file_pause_issue(row: str, pause: int | None, lookup_ok: bool) -> Filing:
-    """Reopen and append to the pause issue, or file one; report how far it got."""
+def _file_pause_issue(row: str, pause: int | None, lookup_ok: bool) -> str:
+    """Reopen and append to the pause issue, or file one; say what to close.
+
+    Returns the recovery sentence the refusal annotation ends with, because
+    how far this got and what a maintainer can do about it are the same fact.
+    Splitting them apart invites the one wrong answer that matters: saying
+    "could not be filed" about an issue that *was* filed sends a maintainer
+    away from the one thing that would restart the bot.
+    """
     if pause is None:
         # Only look again when there is nothing to append to. The jitter
         # narrows the create-create race, so it buys nothing once the issue is
@@ -375,13 +338,19 @@ def _file_pause_issue(row: str, pause: int | None, lookup_ok: bool) -> Filing:
             _issue.comment(pause, row)
         except subprocess.CalledProcessError:
             _common.annotate("warning", f"Could not append this run's row to #{pause}.")
-        return Filing(lookup_ok=lookup_ok, filed=True, number=pause)
+        return f"Refused runs are listed in #{pause}; closing it doubles the ceiling."
 
     if not lookup_ok:
         # Neither read succeeded, so whether an issue is already open is
         # unknown; file nothing. See the re-read above for why a second issue
-        # is worse here than none.
-        return Filing(lookup_ok=False, filed=False, number=None)
+        # is worse here than none. An issue may well be open and worth closing
+        # — this run just never managed to see it — so unlike a failed create,
+        # naming the label is all this can offer toward it.
+        return (
+            "This repo's issues could not be read (see the error above), so none was "
+            f"filed; if an open `{PAUSE_LABEL}` issue exists, closing it doubles the "
+            "ceiling."
+        )
 
     _issue.ensure_label(PAUSE_LABEL, PAUSE_DESCRIPTION, PAUSE_COLOR)
     # The row twice over: it seeds the body, and it goes to the reconcile as
@@ -400,8 +369,19 @@ def _file_pause_issue(row: str, pause: int | None, lookup_ok: bool) -> Filing:
         # already at abnormal volume, which is when GitHub is likeliest to
         # answer `issue create` with a secondary rate limit. It must not cost
         # the run its annotation, this run's only trace.
-        return Filing(lookup_ok=True, filed=False, number=None)
-    return Filing(lookup_ok=True, filed=True, number=number)
+        return (
+            "The pause issue could not be filed (see the error above), so there is "
+            "nothing to close and the ceiling holds until the UTC rollover."
+        )
+    if number is None:
+        # Filed, but no number came back: `gh issue create` printed something
+        # other than an issue URL. The label points at the same issue just as
+        # uniquely, where naming `#` would point at nothing.
+        return (
+            f"Refused runs are listed in the open `{PAUSE_LABEL}` issue; closing it "
+            "doubles the ceiling."
+        )
+    return f"Refused runs are listed in #{number}; closing it doubles the ceiling."
 
 
 def _total_count(path: str) -> int:

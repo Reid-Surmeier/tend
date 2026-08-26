@@ -67,7 +67,6 @@ def verdict(
     def go(
         *,
         stream: str | None = "",
-        status: str = "exited",
         claude_exit: int | None = 0,
         show_full_output: str = "false",
         stderr_log: str = "boom: the agent's last words\n",
@@ -78,7 +77,6 @@ def verdict(
         log = tmp_path / "stderr.log"
         log.write_text(stderr_log)
         code = run_claude.verdict(
-            status=status,
             claude_exit=claude_exit,
             stream_json=stream_json,
             stderr_log=log,
@@ -306,16 +304,14 @@ def test_verdict_never_quotes_a_tool_call_as_the_reason(verdict: Verdict) -> Non
 
 
 def test_verdict_reports_the_supervisor_timeout(verdict: Verdict) -> None:
-    """The bound is a status, never an exit code.
+    """The bound is the absence of an exit code, never a particular one.
 
     Reading a code would put "exited non-zero" in the outage issue for a run
     that simply needs a bigger `timeout_seconds`, and the agent can return any
     code the supervisor might have claimed for itself.
     """
     code, out, _ = verdict(
-        status="timeout",
-        claude_exit=None,
-        stream=_ev_text("some text the agent got out first"),
+        claude_exit=None, stream=_ev_text("some text the agent got out first")
     )
 
     assert code == 1
@@ -557,10 +553,8 @@ def test_launch_composes_the_file_then_the_context_then_tends_own_names(
 ) -> None:
     """`sudo env` replaces the environment, so this list is all the agent gets.
 
-    The file first (an adopter's `sandbox_env:` reaches it), the GitHub context
-    after it so nothing in the file can decide what the run thinks it is, then
-    tend's own assignments, which have to beat the file and cannot displace the
-    context because none is GITHUB_*-named.
+    The order is `_sandbox.launch_env`'s postcondition, plus tend's own
+    assignments last; this pins the whole crossing as one argv.
     """
     result = launch(stream=_ev_result())
     argv = result.command("claude").argv
@@ -758,19 +752,6 @@ def test_supervise_reaps_the_sandbox_uid_when_the_runner_cancels_the_job(
         ["sudo", "pkill", "-KILL", "-u", "tend-sandbox"]
     ]
     assert agent.waits == 2, "`sudo` was left unreaped after the KILL"
-
-
-def test_launch_reports_the_bound_without_consulting_an_exit_code(
-    launch: Launcher,
-) -> None:
-    """The bound raises, which is the answer; no code has to be interpreted."""
-    result = launch(timed_out=True, stream=_ev_text("got partway"))
-
-    assert result.code == 1
-    assert "::error::Claude headless run exceeded 900s timeout" in result.out
-    assert "Supervisor: status=timeout" in result.out
-    assert "claude_exit=none" in result.out
-    assert "exited non-zero" not in result.out
 
 
 def test_launch_reports_a_signalled_child_in_shell_convention(

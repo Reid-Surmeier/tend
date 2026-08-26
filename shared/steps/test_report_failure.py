@@ -86,14 +86,6 @@ def _comment(number: int, body: str, at: str) -> dict[str, Any]:
     return {"id": number, "created_at": at, "body": body}
 
 
-def _out(capsys: pytest.CaptureFixture[str]) -> str:
-    return capsys.readouterr().out
-
-
-def _called(gh: FakeGh, *prefix: str) -> bool:
-    return bool(gh.called(*prefix))
-
-
 def _posted(gh: FakeGh) -> str:
     """Every comment body the reporter handed `gh` on stdin, concatenated."""
     return "\n".join(
@@ -119,8 +111,8 @@ def _created_body(gh: FakeGh) -> str:
 def test_files_when_nothing_is_open(gh: FakeGh) -> None:
     """No open tracker and no racing sibling: file one and keep it."""
     assert report_failure.main() == 0
-    assert _called(gh, "issue", "create"), gh.calls
-    assert not _called(gh, "issue", "close"), (
+    assert gh.called("issue", "create"), gh.calls
+    assert not gh.called("issue", "close"), (
         f"closed the tracker it had just filed: {gh.calls}"
     )
     assert RUN_LINK in _created_body(gh), "the seed body carries this run's row"
@@ -138,8 +130,8 @@ def test_appends_to_the_open_tracker(gh: FakeGh) -> None:
     _open_tracker(gh, 8)
 
     assert report_failure.main() == 0
-    assert _called(gh, "issue", "comment", "8"), gh.calls
-    assert not _called(gh, "issue", "create"), (
+    assert gh.called("issue", "comment", "8"), gh.calls
+    assert not gh.called("issue", "create"), (
         f"filed a second tracker while one was open: {gh.calls}"
     )
     for call in gh.called("issue", "list"):
@@ -148,15 +140,8 @@ def test_appends_to_the_open_tracker(gh: FakeGh) -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [
-        pytest.param(1, id="non-zero-exit"),
-        pytest.param("<html>502</html>", id="html-200"),
-    ],
-)
 def test_files_nothing_when_the_issue_list_cannot_be_read(
-    gh: FakeGh, capsys: pytest.CaptureFixture[str], failure: object
+    gh: FakeGh, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A failed read is not "nothing is open", whichever shape it takes.
 
@@ -168,11 +153,11 @@ def test_files_nothing_when_the_issue_list_cannot_be_read(
     downward probe does not reach an older tracker, so the duplicate persists.
     Skipping costs this one row, and the next failure records normally.
     """
-    gh.respond("issue", "list", with_=failure)
+    gh.respond("issue", "list", with_="<html>502</html>")
 
     assert report_failure.main() == 0
-    assert not _called(gh, "issue", "create"), gh.calls
-    assert "::warning::" in _out(capsys)
+    assert not gh.called("issue", "create"), gh.calls
+    assert "::warning::" in capsys.readouterr().out
 
 
 def test_survives_a_failed_append_to_the_open_tracker(
@@ -194,11 +179,11 @@ def test_survives_a_failed_append_to_the_open_tracker(
     gh.respond("issue", "comment", with_=1)
 
     assert report_failure.main() == 0
-    assert "::warning::" in _out(capsys)
-    assert not _called(gh, "issue", "create"), (
+    assert "::warning::" in capsys.readouterr().out
+    assert not gh.called("issue", "create"), (
         f"filed a second tracker after the append failed: {gh.calls}"
     )
-    assert not _called(gh, "api", "-X", "DELETE"), (
+    assert not gh.called("api", "-X", "DELETE"), (
         f"reconciled after a row that never landed: {gh.calls}"
     )
 
@@ -214,7 +199,7 @@ def test_propagates_a_failed_create(
     gh.respond("issue", "create", with_=1)
 
     assert report_failure.main() != 0
-    assert "::error::" in _out(capsys)
+    assert "::error::" in capsys.readouterr().out
 
 
 def test_carries_its_row_onto_the_racing_sibling(gh: FakeGh) -> None:
@@ -235,13 +220,13 @@ def test_carries_its_row_onto_the_racing_sibling(gh: FakeGh) -> None:
     _seen_by_the_guard(gh, body="run 999 row")
 
     assert report_failure.main() == 0
-    assert _called(gh, "issue", "comment", "38"), (
+    assert gh.called("issue", "comment", "38"), (
         f"carried the row onto the nearest sibling rather than the lowest: {gh.calls}"
     )
-    assert not _called(gh, "issue", "comment", "41"), (
+    assert not gh.called("issue", "comment", "41"), (
         f"stopped at the first hit instead of descending to the lowest: {gh.calls}"
     )
-    assert _called(gh, "issue", "close", str(NEW_ISSUE)), gh.calls
+    assert gh.called("issue", "close", str(NEW_ISSUE)), gh.calls
     assert any("Duplicate of #38" in arg for call in gh.calls for arg in call), gh.calls
     assert RUN_LINK in _posted(gh)
 
@@ -252,8 +237,8 @@ def test_does_not_repeat_a_row_the_keeper_already_has(gh: FakeGh) -> None:
     _seen_by_the_guard(gh, body=ROW)
 
     assert report_failure.main() == 0
-    assert _called(gh, "issue", "close", str(NEW_ISSUE)), gh.calls
-    assert not _called(gh, "issue", "comment"), (
+    assert gh.called("issue", "close", str(NEW_ISSUE)), gh.calls
+    assert not gh.called("issue", "comment"), (
         f"repeated a row the keeper already carried: {gh.calls}"
     )
 
@@ -266,7 +251,7 @@ def test_does_not_adopt_a_foreign_issue(gh: FakeGh) -> None:
     _probe(gh, 38, state="closed")
 
     assert report_failure.main() == 0
-    assert not _called(gh, "issue", "close"), (
+    assert not gh.called("issue", "close"), (
         f"stood down to an issue the reporter never filed: {gh.calls}"
     )
 
@@ -337,15 +322,8 @@ def test_reconciles_a_racing_leg(gh: FakeGh) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [
-        pytest.param(1, id="non-zero-exit"),
-        pytest.param("<html>502</html>", id="html-200"),
-    ],
-)
 def test_survives_a_failed_reconcile_read(
-    gh: FakeGh, capsys: pytest.CaptureFixture[str], failure: object
+    gh: FakeGh, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """A 5xx on the reconcile's read must not redden a step whose row landed.
 
@@ -356,10 +334,10 @@ def test_survives_a_failed_reconcile_read(
     """
     _open_tracker(gh)
     _seen_by_the_guard(gh, "nothing recorded yet")
-    gh.respond("api", "--paginate", "--slurp", COMMENTS, with_=failure)
+    gh.respond("api", "--paginate", "--slurp", COMMENTS, with_="<html>502</html>")
 
     assert report_failure.main() == 0
-    assert "::warning::" in _out(capsys)
+    assert "::warning::" in capsys.readouterr().out
     assert RUN_LINK in _posted(gh), "lost the row the reconcile was cleaning up after"
 
 

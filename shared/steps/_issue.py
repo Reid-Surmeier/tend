@@ -13,28 +13,6 @@ approvals, so the preflight reopens it.
 
 Inputs (env, from Actions): ``GITHUB_SERVER_URL``, ``GITHUB_REPOSITORY``,
 ``GITHUB_RUN_ID``, ``GITHUB_EVENT_NAME``, ``GITHUB_EVENT_PATH``.
-
-Decisions worth keeping in view:
-
-- Which issues are *this record's* has one definition (:func:`matching`), so
-  the lookup and the reconciler cannot come to disagree about it. All three
-  constraints earn their place: the label alone pins neither author nor title,
-  and the bot holds ``issues: write`` — a label put on somebody else's issue
-  would otherwise nominate it, which matters most where a close on that issue
-  is read as an approval.
-- :func:`canonical` returns the *lowest*-numbered match rather than the
-  newest, because a race can leave a duplicate the reconcile then closes; the
-  lowest is the one every caller must agree on. It raises rather than
-  returning ``None`` when the read itself fails — "the read failed" and "there
-  is none" are different facts, and a caller that conflates them files a fresh
-  record while one is already open.
-- :func:`create_and_reconcile` reconciles by probing issue numbers downwards
-  rather than re-listing. A settle-then-list reconcile reads the same lagging
-  index that lost the race in the first place: observed in practice, a sibling
-  created 3 s earlier was still absent from the list while one created 6 s
-  earlier was present, so two legs whose creates landed in the same second
-  each read back only their own issue and closed nothing. ``GET /issues/{n}``
-  is a primary-key read and returns a sibling the instant it exists.
 """
 
 from __future__ import annotations
@@ -167,8 +145,12 @@ def matching(label: str, state: str, title: str) -> list[int]:
 def canonical(label: str, state: str, title: str) -> int | None:
     """The one that counts: lowest-numbered, ``None`` when there is none.
 
-    Raises ``CalledProcessError`` when the list read itself fails — see the
-    module docstring for why that is not the same answer as ``None``.
+    Lowest rather than newest, because a race can leave a duplicate the
+    reconcile then closes and the lowest is the one every leg computes alike.
+
+    Raises ``CalledProcessError`` when the list read itself fails. "The read
+    failed" and "there is none" are different facts, and a caller that
+    conflates them files a fresh record while one is already open.
     """
     numbers = matching(label, state, title)
     return numbers[0] if numbers else None
@@ -216,10 +198,12 @@ def is_ours(issue: dict[str, Any], *, title: str, label: str, login: str) -> boo
     """Whether *issue* is an open record this bot filed under *title*/*label*.
 
     The same three constraints :func:`matching` applies — author, title, label
-    — checked one issue at a time. Author above all: the bot holds
-    ``issues: write``, so without it a label put on somebody else's issue
-    could be adopted as the keeper, and on the rate-limit record a close is
-    read as an approval.
+    — checked one issue at a time. Two predicates rather than one because the
+    call shapes differ: ``matching`` scopes a listing server-side, this reads a
+    single issue object. Nothing holds them in step, so a change to either
+    belongs in both. Author above all: the bot holds ``issues: write``, so
+    without it a label put on somebody else's issue could be adopted as the
+    keeper, and on the rate-limit record a close is read as an approval.
     """
     return (
         issue.get("state") == "open"
@@ -247,10 +231,17 @@ def create_and_reconcile(label: str, title: str, row: str, body: str) -> int | N
     narrows the window when sibling jobs trip at near-identical times but
     cannot close it: two legs can still both read the list as empty within the
     few seconds the index takes to reflect a fresh create, and each files its
-    own. Hence the downward probe, and hence deferring to the *lowest* match
-    rather than the nearest — convergent, because every leg computes the same
-    keeper from its own vantage point and only higher-numbered legs stand
-    down.
+    own.
+
+    The probe goes downwards rather than re-listing, because a settle-then-list
+    reconcile reads the same lagging index that lost the race in the first
+    place: observed in practice, a sibling created 3 s earlier was still absent
+    from the list while one created 6 s earlier was present, so two legs whose
+    creates landed in the same second each read back only their own issue and
+    closed nothing. ``GET /issues/{n}`` is a primary-key read and returns a
+    sibling the instant it exists. Deferring to the *lowest* match rather than
+    the nearest is what makes it converge: every leg computes the same keeper
+    from its own vantage point, and only higher-numbered legs stand down.
 
     Self-close-only is a deliberate narrowing: closing every higher duplicate
     a leg could see only ever worked when the lagging list happened to be

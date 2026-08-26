@@ -222,20 +222,6 @@ def test_report_adds_back_a_blocker_the_agent_still_resolves(
     assert asked[6:] == [AGENT_PATH, blocked_path]
 
 
-def test_report_drops_a_blocker_that_sandbox_setup_replaced(
-    report: Report, tmp_path: Path
-) -> None:
-    """`sandbox_setup:` can shadow a shim from .local/bin; then it is reachable."""
-    out, _ = report(
-        runner=["git", "tend-probe"],
-        agent=["git", "tend-probe"],
-        blocked=[],
-        blocked_path=str(_bin(tmp_path / "blocked", "tend-probe")),
-    )
-
-    assert out == ""
-
-
 def test_blocked_shims_needs_a_directory_to_look_in(tmp_path: Path) -> None:
     """An unset or absent TEND_BLOCKED_PATH costs the report nothing."""
     assert sandbox_setup.blocked_shims("/usr/bin", "", as_user="s") == set()

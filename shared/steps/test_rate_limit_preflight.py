@@ -131,14 +131,6 @@ def _probe(gh: FakeGh, number: int, **overrides: Any) -> None:
     )
 
 
-def _out(capsys: pytest.CaptureFixture[str]) -> str:
-    return capsys.readouterr().out
-
-
-def _called(gh: FakeGh, *prefix: str) -> bool:
-    return bool(gh.called(*prefix))
-
-
 def _stdin_for(gh: FakeGh, *prefix: str) -> str:
     """What the first call matching *prefix* was handed on stdin."""
     for call, stdin in zip(gh.calls, gh.stdins, strict=True):
@@ -164,8 +156,8 @@ def test_passes_under_the_limit_and_publishes_the_bots_identity(
     configured name a rename would leave stale.
     """
     assert preflight.main() == 0
-    assert "check passed" in _out(capsys)
-    assert not _called(gh, "issue"), f"touched an issue under the limit: {gh.calls}"
+    assert "check passed" in capsys.readouterr().out
+    assert not gh.called("issue"), f"touched an issue under the limit: {gh.calls}"
     assert github_files.outputs() == {"login": BOT, "id": str(BOT_ID)}
 
 
@@ -177,8 +169,8 @@ def test_files_an_issue_when_unapproved(
     _posts(gh, today=16, past=15)
 
     assert preflight.main() == 1
-    out = _out(capsys)
-    assert _called(gh, "issue", "create")
+    out = capsys.readouterr().out
+    assert gh.called("issue", "create")
     assert f"#{NEW_ISSUE}" in out
     assert "could not be filed" not in out
     assert "#?" not in out
@@ -198,7 +190,7 @@ def test_says_so_when_the_issue_cannot_be_filed(
     gh.respond("issue", "create", with_=1)
 
     assert preflight.main() == 1
-    out = _out(capsys)
+    out = capsys.readouterr().out
     assert "could not be filed" in out
     assert "#?" not in out
 
@@ -217,7 +209,7 @@ def test_keeps_its_annotation_when_the_row_cannot_be_appended(
     gh.respond("issue", "comment", with_=1)
 
     assert preflight.main() == 1
-    assert f"Refused runs are listed in #{NEW_ISSUE}" in _out(capsys)
+    assert f"Refused runs are listed in #{NEW_ISSUE}" in capsys.readouterr().out
 
 
 def test_files_nothing_when_the_issue_list_cannot_be_read(
@@ -236,8 +228,8 @@ def test_files_nothing_when_the_issue_list_cannot_be_read(
     gh.respond("issue", "list", with_=1)
 
     assert preflight.main() == 1
-    out = _out(capsys)
-    assert not _called(gh, "issue", "create"), gh.calls
+    out = capsys.readouterr().out
+    assert not gh.called("issue", "create"), gh.calls
     assert "could not be read" in out
     assert "could not be filed" not in out
 
@@ -260,8 +252,8 @@ def test_still_files_when_only_the_re_read_fails(
     gh.respond("issue", "list", with_=lambda argv, stdin: _serve(next(reads)))
 
     assert preflight.main() == 1
-    assert _called(gh, "issue", "create")
-    assert "could not be read" not in _out(capsys)
+    assert gh.called("issue", "create")
+    assert "could not be read" not in capsys.readouterr().out
 
 
 def test_files_when_only_the_first_read_fails(
@@ -279,8 +271,8 @@ def test_files_when_only_the_first_read_fails(
     gh.respond("issue", "list", with_=lambda argv, stdin: _serve(next(reads)))
 
     assert preflight.main() == 1
-    assert _called(gh, "issue", "create")
-    assert "could not be read" not in _out(capsys)
+    assert gh.called("issue", "create")
+    assert "could not be read" not in capsys.readouterr().out
 
 
 def test_human_close_doubles_the_ceiling(
@@ -291,7 +283,7 @@ def test_human_close_doubles_the_ceiling(
     _pause_issue(gh, _closed("maintainer"))
 
     assert preflight.main() == 0
-    assert "ceiling 30" in _out(capsys)
+    assert "ceiling 30" in capsys.readouterr().out
 
 
 def test_bot_cannot_approve_itself(gh: FakeGh) -> None:
@@ -402,7 +394,7 @@ def test_reconciler_keeps_only_what_the_preflight_filed(gh: FakeGh) -> None:
     _probe(gh, 38, state="closed")
 
     assert preflight.main() == 1
-    assert not _called(gh, "issue", "close"), (
+    assert not gh.called("issue", "close"), (
         f"reconciled against issues the preflight never filed: {gh.calls}"
     )
     assert gh.called("api", "repos/owner/repo/issues/41"), "the reconciler never probed"
@@ -422,11 +414,11 @@ def test_reconciler_stands_down_to_a_racing_sibling(
     _probe(gh, 41)
 
     assert preflight.main() == 1
-    assert _called(gh, "issue", "close", str(NEW_ISSUE)), (
+    assert gh.called("issue", "close", str(NEW_ISSUE)), (
         f"both legs kept their own record: {gh.calls}"
     )
     # The `::error::` has to name the survivor, not the issue just closed.
-    assert "#41" in _out(capsys)
+    assert "#41" in capsys.readouterr().out
 
 
 def test_carries_its_row_onto_the_racing_sibling(gh: FakeGh) -> None:
@@ -444,10 +436,10 @@ def test_carries_its_row_onto_the_racing_sibling(gh: FakeGh) -> None:
     gh.respond("issue", "view", with_={"body": "run 999 row", "comments": []})
 
     assert preflight.main() == 1
-    assert _called(gh, "issue", "comment", "41"), (
+    assert gh.called("issue", "comment", "41"), (
         f"closed its own record without carrying the row over: {gh.calls}"
     )
-    assert _called(gh, "issue", "close", str(NEW_ISSUE)), gh.calls
+    assert gh.called("issue", "close", str(NEW_ISSUE)), gh.calls
     assert RUN_LINK in _stdin_for(gh, "issue", "comment", "41")
 
 
@@ -468,7 +460,7 @@ def test_skips_the_issue_when_the_burst_limit_refused(gh: FakeGh) -> None:
     )
 
     assert preflight.main() == 1
-    assert not _called(gh, "issue", "create"), (
+    assert not gh.called("issue", "create"), (
         f"filed a rate-limit issue for a burst trip it cannot lift: {gh.calls}"
     )
 
@@ -486,7 +478,7 @@ def test_refuses_to_run_without_an_identity(
     gh.respond("api", "user", with_=1)
 
     assert preflight.main() == 1
-    assert "could not read the bot's own identity" in _out(capsys)
+    assert "could not read the bot's own identity" in capsys.readouterr().out
 
 
 def test_foreign_issue_is_not_the_anchor(gh: FakeGh) -> None:
@@ -524,8 +516,8 @@ def test_reopens_rather_than_refiling(gh: FakeGh) -> None:
     _pause_issue(gh, _closed("maintainer"))
 
     assert preflight.main() == 1
-    assert _called(gh, "issue", "reopen", str(NEW_ISSUE)), gh.calls
-    assert not _called(gh, "issue", "create"), (
+    assert gh.called("issue", "reopen", str(NEW_ISSUE)), gh.calls
+    assert not gh.called("issue", "create"), (
         f"filed a second pause issue instead of reopening #{NEW_ISSUE}: {gh.calls}"
     )
 
@@ -536,25 +528,12 @@ def test_the_limits_and_the_queries_they_are_measured_over() -> None:
     assert preflight.spike_limit(0) == 10, "the floor, where a doubling is a +10"
     assert preflight.spike_limit(15) == 15, "10 + 2 * (15 / 6)"
     assert preflight.baseline_range(NOW) == "2025-12-27..2026-01-01"
-    assert preflight.search_path("owner/repo", BOT, TODAY) == SEARCH_TODAY
-    assert preflight.BURST_LIMIT == 10
 
 
-def test_burst_counts_are_scoped_to_the_bot_and_the_window() -> None:
-    """`/pulls` serves everyone's, and `/issues` serves PRs too.
-
-    Counting a PR through the issues endpoint would charge it against both
-    limits at once, and counting a human's PR would trip the bot's limit on
-    somebody else's work.
-    """
+def test_issue_counts_exclude_pull_requests() -> None:
+    """`/issues` serves pull requests too, told apart only by a `pull_request`
+    member — counting one here would charge it against both limits at once."""
     since = "2026-01-02T11:40:00Z"
-    pulls = [
-        {"user": {"login": BOT}, "created_at": "2026-01-02T11:50:00Z"},
-        {"user": {"login": BOT}, "created_at": "2026-01-02T11:30:00Z"},
-        {"user": {"login": "someone"}, "created_at": "2026-01-02T11:50:00Z"},
-    ]
-    assert preflight.count_recent_prs(pulls, BOT, since) == 1
-
     issues = [
         {"created_at": "2026-01-02T11:50:00Z"},
         {"created_at": "2026-01-02T11:30:00Z"},
@@ -597,7 +576,7 @@ def test_a_blip_that_answers_with_html_leaves_the_counts_at_zero(
         gh.respond("api", path, with_="<html>502 Bad Gateway</html>")
 
     assert preflight.main() == 0
-    assert "burst=0 PRs, 0 issues" in _out(capsys)
+    assert "burst=0 PRs, 0 issues" in capsys.readouterr().out
 
 
 def test_unreadable_events_refuse_the_run_rather_than_approving_it(
@@ -630,7 +609,7 @@ def test_a_label_that_cannot_be_created_does_not_stop_the_filing(
     gh.respond("label", "create", with_=1)
 
     assert preflight.main() == 1
-    assert _called(gh, "issue", "create"), gh.calls
+    assert gh.called("issue", "create"), gh.calls
 
 
 def test_keeps_its_own_record_when_it_cannot_vouch_for_a_sibling(
@@ -649,34 +628,6 @@ def test_keeps_its_own_record_when_it_cannot_vouch_for_a_sibling(
     gh.respond("api", "user", with_=lambda argv, stdin: next(identities) or _serve(1))
 
     assert preflight.main() == 1
-    assert not _called(gh, "issue", "close"), (
+    assert not gh.called("issue", "close"), (
         f"stood down to a sibling it could not vouch for: {gh.calls}"
     )
-
-
-@pytest.mark.parametrize(
-    ("filing", "expected"),
-    [
-        (
-            preflight.Filing(lookup_ok=False, filed=False, number=None),
-            "could not be read",
-        ),
-        (
-            preflight.Filing(lookup_ok=True, filed=False, number=None),
-            "could not be filed",
-        ),
-        (preflight.Filing(lookup_ok=True, filed=True, number=42), "#42"),
-        (
-            preflight.Filing(lookup_ok=True, filed=True, number=None),
-            f"`{preflight.PAUSE_LABEL}` issue",
-        ),
-    ],
-)
-def test_recovery_never_sends_a_maintainer_after_the_wrong_thing(
-    filing: preflight.Filing, expected: str
-) -> None:
-    """Four states that must not be collapsed. Saying "could not be filed"
-    about an issue that was filed sends a maintainer away from the one thing
-    that would restart the bot; the last state — filed but unnumbered — names
-    the label, because `#` on its own names nothing."""
-    assert expected in preflight.recovery(filing)

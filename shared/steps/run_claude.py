@@ -16,23 +16,13 @@ Publishes ``stream_json``. Used by the Claude harness action.
 Decisions this module owns:
 
 * **The supervisor times the run, so nothing infers the bound from an exit
-  code.** ``subprocess.run(timeout=…)`` raises on the bound, which is the
-  answer; a code cannot give it, since a killed agent and a crashing one both
-  land on the same numbers and the agent may return them itself.
-* **The agent is signalled by uid, not through its parent.** The child is
-  ``sudo``, which relays nothing, so ``pkill -u`` is the only way to reach the
-  agent. Overrunning the bound sends a TERM and :data:`TERM_GRACE_SEC` to
-  flush; the KILL then runs after every launch, timeout or not
-  (:func:`supervise`'s ``finally``).
+  code.** Waiting with a timeout raises on the bound, which is the answer; a
+  code cannot give it, since a killed agent and a crashing one both land on the
+  same numbers and the agent may return them itself.
 * **A zero exit does NOT mean the turn succeeded.** ``claude -p`` exits 0 on
   rate limits, max turns, auth failures and a failed final model request, and
   ``is_error: true`` occurs even on subtype ``success``. The last ``result``
   event decides; a turn with no result event never completed.
-* **The agent's own output can issue workflow commands.** The runner reads
-  ``::``-prefixed commands from the start of any line a step prints, so the
-  stderr tail goes inside :func:`_common.stop_commands`. The reason quoted in
-  the annotation needs no bracket: it is flattened to one line and embedded
-  mid-line rather than starting one.
 """
 
 from __future__ import annotations
@@ -113,9 +103,8 @@ def launch_argv(
     """The command that launches the agent as the non-sudo sandbox user.
 
     ``sudo env NAME=…`` replaces the environment with only what is listed, so
-    :func:`_sandbox.launch_env` carries it. tend's own assignments follow and so
-    win, which is what they want — none is ``GITHUB_*``-named, so none can
-    displace the context.
+    :func:`_sandbox.launch_env` composes it; tend's own ``BOT_*``/``CI``
+    assignments are the caller-appended names that docstring allows for.
 
     The model, tools and prompts are argv rather than environment: nothing on
     the far side reads them, and ``--permission-mode`` restates what
@@ -153,16 +142,9 @@ def launch_argv(
 class Supervised:
     """How the supervised launch ended."""
 
-    #: ``timeout`` if the bound cut the run short, else ``exited``.
-    status: str
     #: The agent's exit code, or None when the bound killed the run.
     exit_code: int | None
     elapsed: int
-
-
-def exit_code(returncode: int) -> int:
-    """A shell-convention exit code: ``128 + N`` when signal *N* killed the child."""
-    return 128 - returncode if returncode < 0 else returncode
 
 
 class Cancelled(BaseException):
@@ -266,12 +248,14 @@ def supervise(
                 argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err
             )
             try:
-                status, code = "exited", exit_code(agent.wait(timeout_sec))
+                returncode = agent.wait(timeout_sec)
+                # Shell convention: 128 + N when signal N killed the child.
+                code = 128 - returncode if returncode < 0 else returncode
             except subprocess.TimeoutExpired:
                 # The bound decides, however the stop then goes: an agent that
                 # takes the TERM and one that has to be killed are the same run
                 # to a maintainer, and the code it leaves says nothing.
-                status, code = "timeout", None
+                code = None
                 signal_sandbox("TERM", sandbox)
                 # `sudo` exits once its child does, so this observes the agent.
                 with contextlib.suppress(subprocess.TimeoutExpired):
@@ -280,7 +264,7 @@ def supervise(
         signal_sandbox("KILL", sandbox)
         if agent is not None:
             agent.wait()
-    return Supervised(status, code, round(time.monotonic() - start))
+    return Supervised(code, round(time.monotonic() - start))
 
 
 def stream_events(stream_json: Path) -> Iterator[dict[str, Any]]:
@@ -401,6 +385,11 @@ def stderr_tail(stderr_log: Path) -> list[str]:
 
 
 def _quote_stderr(stderr_log: Path) -> None:
+    """Print the agent's last words where they cannot issue workflow commands.
+
+    The annotation above them needs no such bracket: the reason is flattened to
+    one line and embedded mid-line rather than starting one.
+    """
     with _common.stop_commands():
         for line in stderr_tail(stderr_log):
             print(line, flush=True)
@@ -408,7 +397,6 @@ def _quote_stderr(stderr_log: Path) -> None:
 
 def verdict(
     *,
-    status: str,
     claude_exit: int | None,
     stream_json: Path,
     stderr_log: Path,
@@ -417,8 +405,7 @@ def verdict(
 ) -> int:
     """The step's exit code, with the annotation and job summary that explain it.
 
-    Anything other than ``timeout`` reads as a normal exit, so a status that
-    somehow arrives malformed costs the timeout's wording, never a green run.
+    ``claude_exit`` is None exactly when the bound killed the run.
     """
     if show_full_output == "true":
         lines = transcript(stream_events(stream_json), TRANSCRIPT_MAX_LINES)
@@ -427,7 +414,7 @@ def verdict(
                 "## Claude transcript\n\n```\n" + "\n".join(lines) + "\n```"
             )
 
-    if status == "timeout":
+    if claude_exit is None:
         return _common.fail(f"Claude headless run exceeded {timeout_sec}s timeout")
 
     if claude_exit:
@@ -521,15 +508,15 @@ def main() -> int:
         stream_json=stream_json,
         stderr_log=stderr_log,
     )
-    reported = "none" if run.exit_code is None else run.exit_code
+    timed_out = run.exit_code is None
     print(
-        f"Supervisor: status={run.status} elapsed={run.elapsed}s "
-        f"claude_exit={reported}",
+        f"Supervisor: status={'timeout' if timed_out else 'exited'} "
+        f"elapsed={run.elapsed}s "
+        f"claude_exit={'none' if timed_out else run.exit_code}",
         flush=True,
     )
 
     return verdict(
-        status=run.status,
         claude_exit=run.exit_code,
         stream_json=stream_json,
         stderr_log=stderr_log,

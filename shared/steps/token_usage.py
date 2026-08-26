@@ -70,10 +70,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import subprocess
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -212,7 +211,9 @@ def claude_usage(*, stream: Path | None, logs_dir: Path, model: str) -> dict[str
         if usage is not None:
             return usage
 
-    return zero_usage(model)
+    return claude_record(
+        lambda _field: 0, turns=0, model=model, cost_usd=0, partial=False
+    )
 
 
 def session_files(logs_dir: Path) -> list[Path]:
@@ -237,6 +238,32 @@ def read_all(paths: Iterable[Path]) -> Iterator[dict[str, Any]]:
         yield from _common.read_ndjson(path)
 
 
+def claude_record(
+    total: Callable[[str], float],
+    *,
+    turns: int,
+    model: str,
+    cost_usd: float | None,
+    partial: bool,
+) -> dict[str, Any]:
+    """The record's eight keys, whichever path accounted the run.
+
+    The three Claude paths differ only in where their numbers come from, so
+    ``total`` takes a usage field's name and returns that path's sum for it.
+    Downstream consumers then read the same eight keys from all three.
+    """
+    return {
+        "input_tokens": total("input_tokens"),
+        "output_tokens": total("output_tokens"),
+        "cache_creation_input_tokens": total("cache_creation_input_tokens"),
+        "cache_read_input_tokens": total("cache_read_input_tokens"),
+        "turns": turns,
+        "model": model,
+        "cost_usd": cost_usd,
+        "partial": partial,
+    }
+
+
 def result_usage(events: Iterable[dict[str, Any]], model: str) -> dict[str, Any] | None:
     """Account from the stream-json's ``result`` events, or None if it has none."""
     results = [event for event in events if event.get("type") == "result"]
@@ -246,16 +273,13 @@ def result_usage(events: Iterable[dict[str, Any]], model: str) -> dict[str, Any]
     def total(field: str) -> float:
         return sum(number(event.get("usage"), field) for event in results)
 
-    return {
-        "input_tokens": total("input_tokens"),
-        "output_tokens": total("output_tokens"),
-        "cache_creation_input_tokens": total("cache_creation_input_tokens"),
-        "cache_read_input_tokens": total("cache_read_input_tokens"),
-        "turns": sum(number(event, "num_turns") for event in results),
-        "model": model,
-        "cost_usd": round_usd(number(results[-1], "total_cost_usd")),
-        "partial": False,
-    }
+    return claude_record(
+        total,
+        turns=sum(number(event, "num_turns") for event in results),
+        model=model,
+        cost_usd=round(number(results[-1], "total_cost_usd"), 2),
+        partial=False,
+    )
 
 
 def session_usage(
@@ -285,29 +309,13 @@ def session_usage(
     def total(field: str) -> float:
         return sum(number(message.get("usage"), field) for message in messages.values())
 
-    return {
-        "input_tokens": total("input_tokens"),
-        "output_tokens": total("output_tokens"),
-        "cache_creation_input_tokens": total("cache_creation_input_tokens"),
-        "cache_read_input_tokens": total("cache_read_input_tokens"),
-        "turns": max(user_lines - sessions, 0),
-        "model": model,
-        "cost_usd": None,
-        "partial": True,
-    }
-
-
-def zero_usage(model: str) -> dict[str, Any]:
-    return {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "turns": 0,
-        "model": model,
-        "cost_usd": 0,
-        "partial": False,
-    }
+    return claude_record(
+        total,
+        turns=max(user_lines - sessions, 0),
+        model=model,
+        cost_usd=None,
+        partial=True,
+    )
 
 
 def codex_usage(events: Iterable[dict[str, Any]], model: str) -> dict[str, Any]:
@@ -338,16 +346,6 @@ def number(container: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
     return value
-
-
-def round_usd(cost: float) -> float:
-    """Cost to the cent, as an int when it lands on one.
-
-    Half rounds up rather than to even, and an integral result stays an integer,
-    so the JSON matches what the jq this replaced emitted.
-    """
-    cents = math.floor(cost * 100 + 0.5)
-    return cents // 100 if cents % 100 == 0 else cents / 100
 
 
 def render_summary(usage: dict[str, Any], *, harness: str) -> str:

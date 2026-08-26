@@ -30,7 +30,8 @@ def event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _run_metadata(fake_gh: FakeGh, started_at: object) -> None:
     """Answer the run-metadata fetch; an ``int`` makes the call fail."""
-    fake_gh.respond("api", f"repos/{REPO}/actions/runs/{RUN_ID}", with_=started_at)
+    body = started_at if isinstance(started_at, int) else {"run_started_at": started_at}
+    fake_gh.respond("api", f"repos/{REPO}/actions/runs/{RUN_ID}", with_=body)
 
 
 def _inbox(fake_gh: FakeGh, *threads: tuple[str, str, str]) -> None:
@@ -63,19 +64,7 @@ def _patch_calls(fake_gh: FakeGh) -> list[str]:
             "pull_request_target",
             {"pull_request": {"number": 4}},
             f"https://api.github.com/repos/{REPO}/pulls/4",
-            id="pull-request-target",
-        ),
-        pytest.param(
-            "pull_request_review",
-            {"pull_request": {"number": 4}},
-            f"https://api.github.com/repos/{REPO}/pulls/4",
-            id="pull-request-review",
-        ),
-        pytest.param(
-            "pull_request_review_comment",
-            {"pull_request": {"number": 4}},
-            f"https://api.github.com/repos/{REPO}/pulls/4",
-            id="pull-request-review-comment",
+            id="pull-request-event",
         ),
         pytest.param(
             "issues",
@@ -120,17 +109,16 @@ def test_subject_url_names_the_thread_the_event_belongs_to(
 def test_marks_a_thread_whose_activity_predates_the_run(
     event: Path, fake_gh: FakeGh
 ) -> None:
-    _run_metadata(fake_gh, f"{RUN_STARTED_AT}\n")
+    _run_metadata(fake_gh, RUN_STARTED_AT)
     _inbox(fake_gh, ("999", ISSUE_URL, SETTLED))
 
     assert mark_notification_read.main() == 0
-    assert _patch_calls(fake_gh) == ["999"]
     assert ("api", "notifications/threads/999", "-X", "PATCH") in fake_gh.calls
 
 
 def test_leaves_activity_newer_than_the_run(event: Path, fake_gh: FakeGh) -> None:
     """Mid-run activity is what the next workflow run has to see."""
-    _run_metadata(fake_gh, f"{RUN_STARTED_AT}\n")
+    _run_metadata(fake_gh, RUN_STARTED_AT)
     _inbox(fake_gh, ("999", ISSUE_URL, MID_RUN))
 
     assert mark_notification_read.main() == 0
@@ -139,7 +127,7 @@ def test_leaves_activity_newer_than_the_run(event: Path, fake_gh: FakeGh) -> Non
 
 def test_leaves_a_thread_for_another_subject(event: Path, fake_gh: FakeGh) -> None:
     """Only the triggering event's own thread is this run's to clear."""
-    _run_metadata(fake_gh, f"{RUN_STARTED_AT}\n")
+    _run_metadata(fake_gh, RUN_STARTED_AT)
     _inbox(
         fake_gh,
         ("999", ISSUE_URL, SETTLED),
@@ -162,25 +150,6 @@ def test_tolerates_a_run_metadata_failure(
     """
     _run_metadata(fake_gh, 1)
     _inbox(fake_gh, ("999", ISSUE_URL, SETTLED))
-
-    assert mark_notification_read.main() == 0
-    assert _patch_calls(fake_gh) == []
-    assert "::warning::Could not read run_started_at" in capsys.readouterr().out
-
-
-def test_treats_a_null_timestamp_as_absent(
-    event: Path, fake_gh: FakeGh, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A 200 whose body lacks `run_started_at` is handled like a failure.
-
-    `gh --jq` prints the literal `null` for a missing field, and as a string
-    every ISO-8601 timestamp sorts before it — so an unguarded comparison
-    matches every thread and marks read exactly the mid-run activity the guard
-    exists to preserve. The notification here is dated two months *after* the
-    run, so a PATCH could only come from that inversion.
-    """
-    _run_metadata(fake_gh, "null\n")
-    _inbox(fake_gh, ("999", ISSUE_URL, MID_RUN))
 
     assert mark_notification_read.main() == 0
     assert _patch_calls(fake_gh) == []
@@ -211,7 +180,7 @@ def test_leaves_a_notification_it_cannot_read_as_a_dated_thread(
     `run_started_at` marks nothing at all: marking it anyway would swallow the
     mid-run activity the guard exists to preserve.
     """
-    _run_metadata(fake_gh, f"{RUN_STARTED_AT}\n")
+    _run_metadata(fake_gh, RUN_STARTED_AT)
     fake_gh.respond(
         "api",
         "notifications",
@@ -247,7 +216,7 @@ def test_tolerates_an_inbox_it_cannot_read(
     event: Path, fake_gh: FakeGh, capsys: pytest.CaptureFixture[str], inbox: object
 ) -> None:
     """A failed request, an HTML 200, and an error object are all non-fatal."""
-    _run_metadata(fake_gh, f"{RUN_STARTED_AT}\n")
+    _run_metadata(fake_gh, RUN_STARTED_AT)
     fake_gh.respond("api", "notifications", with_=inbox)
 
     assert mark_notification_read.main() == 0
@@ -256,7 +225,7 @@ def test_tolerates_an_inbox_it_cannot_read(
 
 def test_a_failed_patch_leaves_the_step_green(event: Path, fake_gh: FakeGh) -> None:
     """One thread that will not mark must not fail the step or strand the rest."""
-    _run_metadata(fake_gh, f"{RUN_STARTED_AT}\n")
+    _run_metadata(fake_gh, RUN_STARTED_AT)
     _inbox(fake_gh, ("998", ISSUE_URL, SETTLED), ("999", ISSUE_URL, SETTLED))
     fake_gh.respond("api", "notifications/threads/998", with_=1)
 

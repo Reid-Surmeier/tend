@@ -18,7 +18,7 @@ Decisions this encodes:
 - A ruleset whose ``current_user_can_bypass`` cannot be read proves nothing
   either way, so it neither blocks nor counts as bypassable; the run falls
   through to the ``.protected`` floor if no other update rule settles it.
-- Any readable value other than ``never`` counts as bypassable, ``null``
+- Any readable value other than ``never`` counts as bypassable, JSON ``null``
   included — an answer that isn't "never" is not a restriction.
 - A rules listing that cannot be read — or that comes back in a shape this
   cannot make rules out of — is treated as "no update rules apply", the same
@@ -31,7 +31,6 @@ Inputs (env): ``GITHUB_REPOSITORY`` (from Actions), plus the bot's
 
 from __future__ import annotations
 
-import subprocess
 from typing import Any
 
 import _common
@@ -79,11 +78,10 @@ def update_ruleset_ids(rules: Any) -> list[int]:
 def main() -> int:
     repo = _common.require_env("GITHUB_REPOSITORY")["GITHUB_REPOSITORY"]
 
-    # The two reads the gate cannot proceed without are left to raise: `_common`
-    # relays gh's own explanation and `run` turns the failure into one error.
-    default_branch = _common.gh(
-        "api", f"repos/{repo}", "--jq", ".default_branch"
-    ).strip()
+    # The two reads the gate cannot proceed without are left to raise. A red
+    # gate is the safe direction, and gh's own explanation — "Bad credentials",
+    # "Not Found" — is already on stderr from `_common.gh`.
+    default_branch = _common.gh_json("api", f"repos/{repo}")["default_branch"]
 
     # A GitHub blip can answer this with an HTML page under a 200, so the parse
     # fails rather than the call: catching only the non-zero exit would abort
@@ -94,38 +92,33 @@ def main() -> int:
     except _common.GH_READ_FAILED:
         rules = []
 
-    verdict = "no-update-rules"  # or: blocked | bypassable
+    bypassable = False
     for ruleset_id in update_ruleset_ids(rules):
         try:
-            can_bypass = _common.gh(
-                "api",
-                f"repos/{repo}/rulesets/{ruleset_id}",
-                "--jq",
-                ".current_user_can_bypass",
-            ).strip()
-        except subprocess.CalledProcessError:
+            ruleset = _common.gh_json("api", f"repos/{repo}/rulesets/{ruleset_id}")
+        except _common.GH_READ_FAILED:
             continue
-        if can_bypass == "never":
-            verdict = "blocked"
-            break
-        verdict = "bypassable"
-
-    if verdict == "blocked":
-        print(
-            "Security preflight passed: bot cannot bypass the restrict-updates "
-            f"ruleset on '{default_branch}'",
-            flush=True,
+        can_bypass = (
+            ruleset.get("current_user_can_bypass")
+            if isinstance(ruleset, dict)
+            else None
         )
-        return 0
-    if verdict == "bypassable":
+        if can_bypass == "never":
+            print(
+                "Security preflight passed: bot cannot bypass the restrict-updates "
+                f"ruleset on '{default_branch}'",
+                flush=True,
+            )
+            return 0
+        bypassable = True
+
+    if bypassable:
         return _common.fail(BYPASS_ERROR.format(branch=default_branch))
 
     # No update rules apply (or none were readable): fall back to requiring
     # that the branch is protected at all, e.g. by required reviews.
-    protected = _common.gh(
-        "api", f"repos/{repo}/branches/{default_branch}", "--jq", ".protected"
-    ).strip()
-    if protected != "true":
+    branch = _common.gh_json("api", f"repos/{repo}/branches/{default_branch}")
+    if branch.get("protected") is not True:
         return _common.fail(UNPROTECTED_ERROR.format(branch=default_branch))
     print(
         f"Security preflight passed: default branch '{default_branch}' is protected",

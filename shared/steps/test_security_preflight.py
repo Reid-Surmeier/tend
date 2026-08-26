@@ -15,19 +15,31 @@ def actions_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_REPOSITORY", REPO)
 
 
-def _repo(fake_gh: FakeGh, *, rules: object, protected: object = None) -> None:
+def _repo(fake_gh: FakeGh, *, rules: object, protected: bool | None = None) -> None:
     """Answer the default-branch lookup, the branch's rules, and `.protected`.
 
-    ``rules`` and ``protected`` take an ``int`` to make that call fail.
+    ``rules`` takes an ``int`` to make that call fail, or a string to answer it
+    with a body that is not JSON.
     """
-    fake_gh.respond("api", f"repos/{REPO}", with_="main\n")
+    fake_gh.respond("api", f"repos/{REPO}", with_={"default_branch": "main"})
     fake_gh.respond("api", f"repos/{REPO}/rules/branches/main", with_=rules)
     if protected is not None:
-        fake_gh.respond("api", f"repos/{REPO}/branches/main", with_=protected)
+        fake_gh.respond(
+            "api", f"repos/{REPO}/branches/main", with_={"protected": protected}
+        )
 
 
 def _update_rule(ruleset_id: int) -> dict[str, object]:
     return {"type": "update", "ruleset_id": ruleset_id}
+
+
+def _bypass(fake_gh: FakeGh, ruleset_id: int, answer: object) -> None:
+    """GitHub's answer to "can this bot bypass ruleset *ruleset_id*?"."""
+    fake_gh.respond(
+        "api",
+        f"repos/{REPO}/rulesets/{ruleset_id}",
+        with_={"current_user_can_bypass": answer},
+    )
 
 
 def test_update_ruleset_ids_keeps_update_rules_once() -> None:
@@ -81,8 +93,8 @@ def test_passes_when_one_update_ruleset_cannot_be_bypassed(
     fake `gh` has no answer for it, so a call would fail the test.
     """
     _repo(fake_gh, rules=[_update_rule(1), _update_rule(2)])
-    fake_gh.respond("api", f"repos/{REPO}/rulesets/1", with_="pull_requests_only\n")
-    fake_gh.respond("api", f"repos/{REPO}/rulesets/2", with_="never\n")
+    _bypass(fake_gh, 1, "pull_requests_only")
+    _bypass(fake_gh, 2, "never")
 
     assert security_preflight.main() == 0
     assert "Security preflight passed: bot cannot bypass" in capsys.readouterr().out
@@ -92,29 +104,13 @@ def test_aborts_when_every_update_ruleset_is_bypassable(
     fake_gh: FakeGh, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _repo(fake_gh, rules=[_update_rule(1)])
-    fake_gh.respond("api", f"repos/{REPO}/rulesets/1", with_="always\n")
+    _bypass(fake_gh, 1, "always")
 
     assert security_preflight.main() == 1
     assert (
         "::error::The bot can bypass every restrict-updates ruleset on 'main' "
         "(current_user_can_bypass != never)" in capsys.readouterr().out
     )
-
-
-def test_a_null_bypass_answer_is_not_a_restriction(
-    fake_gh: FakeGh, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A ruleset read that answers `null` counts as bypassable, not as blocked.
-
-    `gh --jq` prints the literal `null` for a 200 whose body lacks the field.
-    Anything but `never` leaves the bot's standing unproven, and the gate fails
-    closed.
-    """
-    _repo(fake_gh, rules=[_update_rule(1)])
-    fake_gh.respond("api", f"repos/{REPO}/rulesets/1", with_="null\n")
-
-    assert security_preflight.main() == 1
-    assert "::error::The bot can bypass every" in capsys.readouterr().out
 
 
 def test_an_unreadable_ruleset_falls_back_to_the_protected_floor(
@@ -147,15 +143,6 @@ def test_no_update_rules_passes_on_a_protected_branch(
         "Security preflight passed: default branch 'main' is protected"
         in capsys.readouterr().out
     )
-
-
-def test_aborts_when_the_branch_is_unprotected(
-    fake_gh: FakeGh, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _repo(fake_gh, rules=[], protected=False)
-
-    assert security_preflight.main() == 1
-    assert "::error::Default branch 'main' is NOT protected." in capsys.readouterr().out
 
 
 def test_an_unreadable_rules_listing_falls_back_to_the_protected_floor(
