@@ -13,7 +13,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1
-      - run: uv run pytest
+      # Pinned to the interpreter production runs: the step bodies under
+      # shared/steps/ execute on the runner's own /usr/bin/python3, which is
+      # 3.12 on ubuntu-24.04, and an unpinned `uv run` would test them on
+      # whatever newer version uv happens to find.
+      - run: uv run --python 3.12 pytest
       # pypi-release.yaml only fires on a tag push, and the tag is immutable by
       # ruleset, so a build that breaks there costs a manual publish. Run the
       # same command here, where a bad `uv build` invocation fails on its PR.
@@ -69,7 +73,7 @@ jobs:
           grep -qF 'HTTP(S) proxy listening at 127.0.0.1:' "$log"
           test -f "$confdir/mitmproxy-ca-cert.pem"
 
-  # setup-sandbox.sh and sandbox-setup.sh need a second uid, sudo, and a runner
+  # setup-sandbox.sh and sandbox_setup.py need a second uid, sudo, and a runner
   # PATH to derive from, so no Python test reaches them. Running them for real
   # leaves the runner changed — checkout's persisted git credential deleted,
   # o+x along the workspace's ancestors, the proxy CA in the system trust store,
@@ -77,7 +81,10 @@ jobs:
   # only the workspace ownership is restored. This job runs both for
   # real, against the new boundary: shared paths cross, runner-home paths do
   # not, same-name system fallbacks are blocked, and sandbox_setup can install
-  # a required home-scoped tool explicitly.
+  # a required home-scoped tool explicitly. It then runs the agent launch
+  # itself against a stub `claude`, which is the only place shared/steps/
+  # run_claude.py crosses the uid boundary at all — the unit tests replace
+  # subprocess.run, and an adopter first runs the launch after a release.
   test-sandbox:
     runs-on: ubuntu-24.04
     steps:
@@ -88,6 +95,8 @@ jobs:
         run: bash proxy/test-setup-sandbox.sh setup
       - name: Verify the boundary and sandbox_setup
         run: bash proxy/test-setup-sandbox.sh verify
+      - name: Launch, supervise and tear down the agent
+        run: bash proxy/test-setup-sandbox.sh verify-launch
       - name: Refuse unsafe sandbox configuration
         run: bash proxy/test-setup-sandbox.sh verify-refusals
       - name: Restore workspace ownership for checkout cleanup

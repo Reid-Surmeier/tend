@@ -30,7 +30,7 @@
 # (newline-separated dirs prepended to the sandbox PATH) and TEND_SANDBOX_ENV
 # (newline-separated NAME=VALUE pairs added to the agent env; reserved keys
 # rejected). TEND_SANDBOX_SETUP (commands) is consumed by the separate
-# shared/steps/sandbox-setup.sh step, not here.
+# shared/steps/sandbox_setup.py step, not here.
 set -euo pipefail
 
 # Adopter setup actions intentionally mutate PATH; retain it as toolchain data,
@@ -120,8 +120,8 @@ fi
 
 # The agent's launch environment, one NAME=VALUE per line. The two crossings
 # that carry adopter code compose it with the GITHUB_* context, in that order,
-# via shared/steps/lib/sandbox-launch-env.sh; the plugin install reads it
-# straight (mapfile -t + `env "${arr[@]}"`) and takes no context. One file so
+# via shared/steps/_sandbox.py; the plugin install reads it straight
+# (mapfile -t + `env "${arr[@]}"`) and takes no context. One file so
 # none of them can drift. Contents:
 # the proxy routing, CA trust for every client family (system store for
 # gh/git/curl is implicit; NODE_EXTRA_CA_CERTS for claude (Node ignores the
@@ -285,7 +285,7 @@ if [ "${#_blocked_home_command[@]}" -gt 0 ]; then
 fi
 AGENT_PATH="$(IFS=:; printf '%s' "${_agent_path[*]}")"
 # The composed PATH is logged so sandbox_path expansion and dropped locations
-# are visible. sandbox-setup.sh reports missing commands after sandbox_setup
+# are visible. sandbox_setup.py reports missing commands after sandbox_setup
 # has had its chance to install them.
 log "sandbox PATH: ${AGENT_PATH}"
 cat >"$AGENT_ENV_FILE" <<EOF
