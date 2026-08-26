@@ -6,7 +6,10 @@ Run: ``uv run pytest`` from the repo root, which covers every Python suite.
 from __future__ import annotations
 
 import base64
+import os
 import re
+import subprocess
+import sys
 from importlib.metadata import version
 from pathlib import Path
 
@@ -36,6 +39,43 @@ def test_pinned_mitmproxy_matches_the_action() -> None:
         (REPO_ROOT / "claude" / "action.yaml").read_text()
     )
     assert version("mitmproxy") == action["inputs"]["mitmproxy_version"]["default"]
+
+
+def test_proxy_starts_and_finishes_its_empty_replay(tmp_path: Path) -> None:
+    empty_flows = tmp_path / "empty.flows"
+    empty_flows.touch()
+    confdir = tmp_path / "conf"
+    mitmdump = Path(sys.executable).with_name("mitmdump")
+
+    result = subprocess.run(
+        [
+            mitmdump,
+            "-s",
+            REPO_ROOT / "proxy" / "inject_credentials.py",
+            "--listen-host",
+            "127.0.0.1",
+            "--listen-port",
+            "0",
+            "--set",
+            f"confdir={confdir}",
+            "--allow-hosts",
+            r"^example\.invalid$",
+            "--set",
+            f"rfile={empty_flows}",
+        ],
+        env=os.environ
+        | {
+            "TEND_GH_TOKEN": "dummy",
+            "TEND_ANTHROPIC_OAUTH_TOKEN": "dummy",
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HTTP(S) proxy listening at 127.0.0.1:" in result.stdout
+    assert (confdir / "mitmproxy-ca-cert.pem").is_file()
 
 
 def _allow_hosts_regex() -> re.Pattern[str]:
