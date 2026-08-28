@@ -302,6 +302,10 @@ formats, label names, branch routing) belongs in an overlay. Tend has its
 own overlay at `.claude/skills/running-tend/SKILL.md` — use it for guidance
 that only applies to developing tend itself.
 
+Use outcomes from adopter runs to refine the skills. A general missing
+instruction or wrong default belongs in the bundled skill; repository policy
+belongs in that repository's overlay.
+
 ### Authoring skills
 
 When adding to or editing files in `plugins/tend-ci-runner/skills/` or
@@ -350,6 +354,11 @@ for Codex). When adding new capability, split work along this line:
   empty inbox every cron tick) earns its place; a run of bespoke gates,
   each skipping one rare event shape, is machinery that costs more than
   the boots it saves.
+
+Keep the actions' Bash as linear installation and plumbing, not a second
+implementation layer. Do not add branches, retries, caches, or state for rare
+event shapes or small runner-time savings; put substantial behavior in a skill
+or tested Python.
 
 Don't build deterministic YAML steps for work that happens *inside* an
 agent run. Extend the skill instead.
