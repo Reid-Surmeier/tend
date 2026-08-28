@@ -181,7 +181,7 @@ FETCH_FROM=$(date -u -d "$SINCE - 24 hours" +%Y-%m-%dT%H:%M:%SZ)
 for workflow in $(gh api --paginate repos/$REPO/actions/workflows --jq ".workflows[] | select(.name | test(\"$PREFIX_RE\")) | .id"); do
   gh api --paginate "repos/$REPO/actions/workflows/$workflow/runs?created=>=$FETCH_FROM&status=completed&per_page=100" \
     --jq ".workflow_runs[] | select(.updated_at >= \"$SINCE\") | {databaseId: .id, conclusion, createdAt: .created_at, updatedAt: .updated_at, name: .name}"
-done
+done | tee /tmp/review-runs-census.jsonl
 ```
 
 If no runs found, report "no runs to review" and exit.
@@ -211,12 +211,22 @@ After retrieving the timeout cap from the workflow file, flag any job whose dura
 A run that fails files a row on a `tend-outage`-labelled **"Bot temporarily unavailable"** issue, naming the run and the trigger it stranded. Nothing re-runs those triggers — `tend-review` fires only on `pull_request_target`, so a PR whose one review attempt died stays unreviewed until someone pushes. Drain the open issue as part of this sweep.
 
 ```bash
-# Usually empty; no open outage issue means nothing stranded.
+# Usually empty. Runs can fail before filing this issue; see the census below.
 OUTAGE=$(gh issue list --state open --label tend-outage --json number,title \
   --jq '[.[] | select(.title == "Bot temporarily unavailable")][0].number // empty')
 gh issue view "$OUTAGE" --json body,comments --jq '.body, .comments[].body' \
   | grep -oE 'runs/[0-9]+|\| #[0-9]+'
 ```
+
+**The census is the second drain input.** A run that dies before the failure handler can strand its trigger without filing an outage row or uploading a session log. Step 1 already has the needed conclusions:
+
+```bash
+# `skipped` is an `if:` gate declining to run, not a failure.
+jq -c 'select(.conclusion != "success" and .conclusion != "skipped")' \
+  /tmp/review-runs-census.jsonl
+```
+
+For each census failure absent from the outage issue, confirm the trigger's work is still missing. Treat a cancelled run as a designed eviction when another run answered the same thread. Report a stranded trigger as a finding; a census-only failure is not a row on the outage issue and does not hold its close. Do not re-run a census-only row automatically: it has no failure record showing which jobs are safe to replay.
 
 **Diagnose first.** The nightly enrichment comment names the cause when it can. When it doesn't, read the session log — quota exhaustion surfaces as a `<synthetic>` assistant message:
 
