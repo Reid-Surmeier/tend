@@ -7,6 +7,9 @@ on:
 
 jobs:
   notifications:
+    concurrency:
+      group: tend-notifications
+      cancel-in-progress: false
 <<fork_guard_if(cfg)>>    runs-on: ubuntu-24.04
 <<environment()>>
     permissions:
@@ -16,7 +19,6 @@ jobs:
         id: check
         env:
           GITHUB_TOKEN: ${{ secrets.<<bot_token_secret>> }}
-          BOT_NAME: <<cfg.bot_name>>
         run: |
 <<check_script|indent(10, first=True)>>
 

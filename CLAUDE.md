@@ -250,8 +250,8 @@ Events pass through three layers before the bot does work:
    group, never queues).
 2. **Custom `should_run` pre-checks** — cheap deterministic steps that decide
    whether the agent boots: mention's verify job checks engagement, review's
-   gate skips a live HEAD already stamped as examined, notifications' check
-   exits when the inbox is clear.
+   gate skips a live HEAD already stamped as examined, and notifications'
+   check repairs repository watching then captures a paginated cutoff snapshot.
 3. **Concurrency groups** — at most one running job per group.
 
 Concurrency groups:
@@ -263,6 +263,7 @@ Concurrency groups:
 | mention/verify | none | stateless |
 | mention/handle | `workflow-handle-issue#\|PR#` | **no** — each mention runs to completion |
 | triage | `workflow-issue#` | yes — latest comment wins |
+| notifications | `tend-notifications` | **no** — one poll advances the unread queue at a time |
 | ci-fix / nightly / weekly | none | rare overlap or cron-serialized |
 
 **Fork guard.** Workflows whose triggers can fire from a fork's own
@@ -277,15 +278,17 @@ via `head.repo.full_name == github.repository`, so neither needs the
 guard.
 
 **GHA queue depth = 1.** With `cancel-in-progress: false` (mention/handle,
-review), when a third job arrives while one runs and one queues, the pending
-job is replaced. For mention, mitigation lives in the skill prompts: dedup if
-the bot already responded to the triggering comment; self-heal earlier
-comments without a bot reply (oldest first). The workflow injects the
-queue-to-run time delta (seconds between event timestamp and job start) into
-the prompt — over ~40 s indicates the job was queued behind another run,
-making conversation drift more likely. For review, replacement is loss-free
-by construction: the pre-check and the skill both judge the live HEAD, so
-whichever run executes covers the replaced event's commits.
+review, notifications), when a third job arrives while one runs and one
+queues, the pending job is replaced. For mention, mitigation lives in the
+skill prompts: dedup if the bot already responded to the triggering comment;
+self-heal earlier comments without a bot reply (oldest first). The workflow
+injects the queue-to-run time delta (seconds between event timestamp and job
+start) into the prompt — over ~40 s indicates the job was queued behind
+another run, making conversation drift more likely. For review, replacement
+is loss-free by construction: the pre-check and the skill both judge the live
+HEAD, so whichever run executes covers the replaced event's commits.
+Notifications stay unread until a poll records an outcome, so the newest
+pending run covers a replaced poll.
 
 ## Skill design: bundled for everyone, overlay for one
 
