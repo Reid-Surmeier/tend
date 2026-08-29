@@ -105,20 +105,18 @@ def _restore_step_index(steps: list[dict[str, object]]) -> int | None:
 
 
 @pytest.mark.parametrize(
-    ("name", "job", "switch", "gate"),
+    ("name", "job", "switch"),
     [
         (
             "review",
             "review",
             lambda s: s.get("uses", "").startswith("actions/checkout")
             and "ref" in s.get("with", {}),
-            "steps.gate.outputs.should_run",
         ),
         (
             "mention",
             "handle",
             lambda s: "gh pr checkout" in str(s.get("run", "")),
-            None,
         ),
     ],
 )
@@ -127,7 +125,6 @@ def test_local_setup_action_restored_for_post_cleanup(
     name: str,
     job: str,
     switch: object,
-    gate: str | None,
 ) -> None:
     """review and mention land the PR's tree over the workspace a local `setup:`
     composite was loaded from. To dispatch the POST steps of the actions nested
@@ -136,10 +133,8 @@ def test_local_setup_action_restored_for_post_cleanup(
     cleanup (actions/runner#2816). Put the loaded version back before the POST
     chain walks.
 
-    `always()` covers a skip as well as a failure, so where the caller gates its
-    earlier steps the restore carries that gate too: a gate-skipped run checked
-    nothing out, and an unconditional restore would warn about cleaning up a
-    composite that never loaded."""
+    `always()` covers a failed session so cleanup still sees the version the
+    runner loaded."""
     extra = "setup:\n  - uses: ./.github/actions/tend-setup\n"
     cfg = Config.load(_minimal_config(tmp_path, extra))
     steps = yaml.safe_load(GENERATORS[name](cfg).content)["jobs"][job]["steps"]
@@ -151,12 +146,7 @@ def test_local_setup_action_restored_for_post_cleanup(
     assert condition.startswith("always()"), (
         f"{name}: the restore has to run even when the session fails"
     )
-    if gate is None:
-        assert condition == "always()", f"{name}: gates at the job level"
-    else:
-        assert gate in condition, (
-            f"{name}: the restore has to skip with the steps it restores for"
-        )
+    assert condition == "always()", f"{name}: restore has an extra gate"
     switch_idx = next(i for i, s in enumerate(steps) if switch(s))  # type: ignore[operator]
     assert idx > switch_idx, f"{name}: the restore has to follow the tree switch"
 
@@ -686,36 +676,23 @@ def test_review_without_setup_checks_out_once(tmp_path: Path) -> None:
     assert "clean" not in checkouts[0]["with"]
 
 
-def test_review_queues_pushes_behind_a_gate(tmp_path: Path) -> None:
-    """A push mid-review queues a replacement run; the gate step decides
-    whether it boots an agent.
-
-    The running session folds the push in and stamps examined commits, so the
-    queued run's work is usually already done. That only holds if the gate is
-    the first step and everything after it — checkouts, setup, the agent — is
-    conditioned on its verdict; an ungated step would run (and bill) on every
-    replaced event.
-    """
+def test_review_preserves_pending_events_without_an_examined_status(
+    tmp_path: Path,
+) -> None:
+    """Every event waits for the current session, including ready-for-review."""
     extra = "setup:\n  - run: npm ci\n"
     cfg = Config.load(_minimal_config(tmp_path, extra))
     workflows = {wf.filename: wf for wf in generate_all(cfg)}
-    data = yaml.safe_load(workflows["tend-review.yaml"].content)
+    content = workflows["tend-review.yaml"].content
+    data = yaml.safe_load(content)
     job = data["jobs"]["review"]
 
     assert job["concurrency"]["cancel-in-progress"] is False
-    steps = job["steps"]
-    assert steps[0].get("id") == "gate"
-    assert "tend-review/$PR" in steps[0]["run"]
-    gate = "steps.gate.outputs.should_run == 'true'"
-    for step in steps[1:]:
-        # A step may narrow further, or widen to `always()` (the reaction comes
-        # off a failed run too), but the gate's verdict stays a conjunct of
-        # whatever it builds. Matched by shape rather than by substring, which
-        # a step disjoining its way past the gate would also satisfy.
-        condition = step.get("if", "")
-        assert condition in (gate, f"always() && ({gate})") or condition.startswith(
-            f"{gate} && "
-        ), f"ungated step after the gate: {step}"
+    assert job["concurrency"]["queue"] == "max"
+    assert "must set\n      # `queue: null`" in content
+    assert all(step.get("id") != "gate" for step in job["steps"])
+    assert "steps.gate" not in content
+    assert "tend-review/" not in content
 
 
 def test_issue_and_pr_acknowledged_with_eyes(tmp_path: Path) -> None:
@@ -739,8 +716,8 @@ def test_issue_and_pr_acknowledged_with_eyes(tmp_path: Path) -> None:
     review = yaml.safe_load(workflows["tend-review.yaml"].content)
     react = _eyes_steps(review["jobs"]["review"]["steps"])[0]
     assert react["env"]["TARGET"] == "issues/${{ github.event.pull_request.number }}"
-    # Nothing beyond the gate: a run that boots an agent says so.
-    assert react["if"] == "steps.gate.outputs.should_run == 'true'"
+    # Every admitted review run boots a session, so each one gets a reaction.
+    assert "if" not in react
 
 
 @pytest.mark.parametrize(
@@ -759,8 +736,10 @@ def test_eyes_come_off_when_the_session_ends(
     none of its steps execute — `always()` governs execution within a job that
     started. React in one job and unreact in another and every route where the
     second job never starts leaves the eyes on with no session behind them.
-    `cancel-in-progress: false` doesn't close that: it holds a *running* job
-    while GitHub still evicts a *pending* one to make room for a newer run.
+    For jobs with the default one-pending-run queue, `cancel-in-progress: false`
+    doesn't close that: it holds a *running* job while GitHub can still evict a
+    *pending* one. Review's `queue: max` prevents ordinary eviction, but keeping
+    both halves in one job preserves the same lifecycle invariant.
 
     Both halves also have to name the same reaction target; one that drifted
     would leave the eyes on every comment the bot ever answered."""
