@@ -379,6 +379,7 @@ def test_setup_step_user_if_narrows_notifications_guard(
     )
     assert step["if"] == (
         "(steps.check.outputs.count != '0' || "
+        "steps.check.outputs.conflict_count != '0' || "
         "github.event_name == 'workflow_dispatch') && (runner.os == 'Linux')"
     )
 
