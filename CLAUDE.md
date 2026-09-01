@@ -21,12 +21,12 @@ over refining it.
 ## Commands
 
 ```bash
-wt test                            # everything: uv run pytest, then worker/'s vitest
-uv run pytest                      # the Python half alone, from the repo root
-uvx tend@latest init               # regenerate workflows from .config/tend.yaml
-uvx tend@latest init --dry-run     # preview without writing
-uvx tend@latest check              # verify branch protection, secrets, bot access
-pre-commit run --all-files         # lint: ruff, typos, actionlint, shellcheck, uv-lock
+wt test                                # everything: uv run pytest, then worker/'s vitest
+uv run pytest                          # the Python half alone, from the repo root
+uvx tend@latest init                   # regenerate workflows from .config/tend.yaml
+uvx tend@latest init --dry-run         # preview without writing
+uvx tend@latest check                  # verify branch protection, secrets, bot access
+uv tool run pre-commit run --all-files # lint: every hook in .pre-commit-config.yaml
 ```
 
 The repo root is a uv workspace, and pytest run from it collects every Python
@@ -36,6 +36,12 @@ one `pytest` is the whole Python run. `wt test` (defined in
 typecheck. Its arguments narrow pytest and nothing else, so a filtered run
 still pays for worker/; `uv run pytest -k render`
 is the Python half on its own.
+
+`pre-commit` is not on the CI sandbox's PATH, which is why the lint command
+above carries the `uv tool run` prefix; a narrower substitute (ruff alone,
+shellcheck alone) skips ten of the thirteen hooks, including the three
+`repo: local` guards — the bang-backtick check, the install-tend mirror sync,
+and the `sandbox_env` reserved-set parity check.
 
 ## Architecture
 
