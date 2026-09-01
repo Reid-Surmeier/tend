@@ -29,16 +29,22 @@ def test_notification_skill_uses_one_paginated_cutoff_snapshot() -> None:
     assert "sort_by(.updated_at)" in skill
 
 
-def test_notification_skill_uses_a_bounded_repository_acknowledgement() -> None:
+def test_notification_skill_acknowledges_only_the_threads_it_resolved() -> None:
+    """The acknowledgement is per thread, never repository-wide.
+
+    `PUT /repos/{owner}/{repo}/notifications` marks by timestamp rather than by
+    outcome, so it acts on threads the run never examined — including a thread
+    deferred because its dedicated workflow is still in flight. REST has no
+    "mark unread", so that overshoot is unrecoverable. Acknowledging exactly the
+    threads that reached an outcome needs no timestamp reasoning at all.
+    """
     skill = _read("plugins", "tend-ci-runner", "skills", "notifications", "SKILL.md")
 
-    assert "repos/$GITHUB_REPOSITORY/notifications" in skill
-    assert 'last_read_at="$ACK_CUTOFF"' in skill
-    assert '"$UNRESOLVED_AT -1 second"' in skill
-    assert 'if [ -n "$UNRESOLVED_AT" ]; then' in skill
-    assert "else\n  ACK_CUTOFF=$CUTOFF" in skill
-    assert "Never acknowledge a same-repository thread individually." in skill
-    assert "notifications/threads/<thread-id>" in skill
+    assert 'gh api "notifications/threads/$THREAD_ID" -X PATCH' in skill
+    assert "repos/$GITHUB_REPOSITORY/notifications" not in skill
+    assert "-f last_read_at=" not in skill
+    assert "ACK_CUTOFF" not in skill
+    assert "Never acknowledge a thread before it has an outcome" in skill
 
 
 def test_notification_skill_pins_the_fragile_dedup_queries() -> None:
