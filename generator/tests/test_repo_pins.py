@@ -179,3 +179,40 @@ def test_inline_run_bodies_pass_shellcheck(action: str) -> None:
             findings.append(f"--- {action} :: {name}\n{result.stdout}")
 
     assert not findings, "\n".join(findings)
+
+
+# Anchoring on `${{ … }}` would match the bare reference alone, letting
+# `${{ inputs.x || '' }}` and `${{ format('{0}', inputs.x) }}` through. Any
+# `inputs.<name>` in a `run:` body is necessarily a GHA expression — bash has no
+# such syntax — so the unanchored match is both simpler and strictly broader.
+# (`inputs['x']` index syntax is missed either way.)
+INPUT_REF = re.compile(r"inputs\.([A-Za-z0-9_]+)")
+
+
+@pytest.mark.parametrize("action", ACTIONS)
+def test_inputs_reach_run_bodies_through_env(action: str) -> None:
+    """An input must not be interpolated into an inline `run:` body.
+
+    GitHub substitutes `${{ … }}` into the script *text* before bash parses it,
+    so a value carrying a quote or `$(…)` stops being a string and becomes
+    script executing as the runner user — which holds the real PAT and, under
+    codex, the model key. Through `env:` the value is passed to the process,
+    never to the parser. Nothing else catches this: shellcheck sees the
+    placeholder the sibling test substitutes in, and actionlint does not read
+    action.yaml at all.
+
+    Every input in both actions already arrives this way, so the rule is a flat
+    ban rather than a list of which values are secret enough to deserve it.
+    """
+    doc = YAML(typ="safe", pure=True).load((REPO_ROOT / action).read_text())
+
+    inlined = [
+        f"{step.get('name', '<unnamed>')} inlines inputs.{name}"
+        for step in doc["runs"]["steps"]
+        if "run" in step
+        for name in sorted(set(INPUT_REF.findall(step["run"])))
+    ]
+    assert not inlined, (
+        f"{action}: pass these through the step's `env:` instead of `${{{{ }}}}` "
+        f"in the body: {inlined}"
+    )
