@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tend lifecycle — throwaway logic prototype</title>
+<style>
+  :root { color-scheme: light; font: 17px/1.5 system-ui,sans-serif; color:#192c2b; background:#f5f7f4; }
+  body { max-width:1080px; margin:auto; padding:32px 20px; }
+  h1 { font-size:2rem; line-height:1.2; margin:8px 0; }
+  h2 { margin:0 0 12px; font-size:1.15rem; }
+  .eyebrow { font-size:.75rem; letter-spacing:.12em; color:#356c60; font-weight:750; }
+  .muted { color:#506663; }
+  section { background:white; border:1px solid #d5dfda; border-radius:12px; padding:22px; margin-top:20px; }
+  .decision { border-left:5px solid #26725e; }
+  #next { font-size:1.65rem; font-weight:750; margin:0; }
+  #reason { margin:5px 0 18px; }
+  dl { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:16px; margin:0; }
+  dt { font-size:.8rem; color:#506663; } dd { margin:3px 0 0; overflow-wrap:anywhere; }
+  button { font:inherit; font-size:.85rem; padding:9px 12px; border:1px solid #a5bfb4; border-radius:6px; color:#173d33; background:#f3f8f5; cursor:pointer; }
+  button:hover, button[aria-selected=true] { background:#d9ece3; }
+  button:focus-visible { outline:3px solid #20755a; outline-offset:3px; }
+  button:disabled { opacity:.55; cursor:default; }
+  .buttons { display:flex; flex-wrap:wrap; gap:8px; }
+  #message { margin-bottom:0; font-weight:650; }
+  #steps { padding-left:24px; } #steps li { margin:9px 0; }
+  .foot { font-size:.82rem; } .tag { color:#26725e; font-weight:700; }
+</style>
+<body>
+<div class="eyebrow">THROWAWAY PROTOTYPE · ISSUE 203 · NO LIVE AGENTS</div>
+<h1>One coordinator. Separate release authority.</h1>
+<p class="muted">Can Tend guide an Issue all the way to verified delivery, without giving an agent the power to approve its own release? Click through the handoffs, then try to break them.</p>
+<p class="foot">Everything below is simulated in memory. Commit names are illustrative. No GitHub, model, credentials, Honcho or host changes are made.</p>
+
+<section class="decision" aria-live="polite">
+  <h2>Tend’s next handoff</h2><p id="next"></p><p id="reason"></p>
+  <dl id="state"></dl><p id="message"></p>
+</section>
+<section><h2>Free play</h2><p class="muted">Every action stays available. An illegal action is rejected, not hidden.</p><div id="actions" class="buttons"></div></section>
+<section><h2>Guided walkthroughs</h2><div id="tabs" class="buttons" role="tablist" aria-label="Scenarios"></div><div id="walkthrough" role="tabpanel"><p id="scenario"></p><ol id="steps"></ol></div></section>
+<p class="foot">Existing procedures: planning/specification Skills → implement + TDD + GitNexus → independent Standards / Spec / Ponytail Ultra → checked steward → Release workflow → live verification. Honcho supplies context, never proof that a step passed.</p>
+
+<script>
+// Portable decision model: no DOM, I/O, persistence, credentials or authority.
+const axes = ['Standards', 'Spec', 'Ponytail Ultra'];
+const initial = () => ({planned:false, specified:false, capabilities:false,
+  hold:false, head:'', revision:0, checks:'missing', reviews:{}, folded:false,
+  releaseRequested:false, released:false, delivery:'unknown', failures:0,
+  message:'An Issue arrived. Tend starts with scope, not a code change.'});
+
+function next(s) {
+  if (s.hold) return ['Held', 'The owner’s hold stops new work, including executor handoffs.'];
+  if (s.failures >= 2) return ['Escalate', 'The two-attempt repair budget is exhausted. No automatic restart.'];
+  if (!s.planned) return ['Plan', 'Use the existing planning Skills to settle the goal and scope.'];
+  if (!s.specified) return ['Specify', 'Acceptance criteria and readiness belong in the Issue.'];
+  if (!s.capabilities) return ['Check setup', 'Verify the pinned Skills and real GitNexus/Honcho access before an agent starts.'];
+  if (!s.head) return ['Implement', 'Use implement, TDD and GitNexus on an unprotected working branch.'];
+  if (s.checks === 'failed') return ['Repair', 'A failed baseline cannot be replaced by a positive review.'];
+  if (s.checks !== s.head) return ['Verify change', 'Run the baseline and GitNexus change analysis on this exact commit.'];
+  if (!axes.every(a => s.reviews[a] === s.head)) return ['Independent review', 'All three reviewers must approve the exact current commit.'];
+  if (!s.folded) return ['Request integration', 'Ask the existing steward to check and integrate this candidate.'];
+  if (!s.released) return ['Request release', 'The protected executor rechecks the integrated commit before publishing.'];
+  if (s.delivery === 'failed') return ['Remediate delivery', 'A published release is not a working deployment. Record a repair or revert request.'];
+  if (s.delivery !== 'passed') return ['Verify delivery', 'Check the actual released result. Publishing is not completion.'];
+  return ['Complete', 'Release and post-release verification are evidenced.'];
+}
+
+function transition(state, action) {
+  if (action === 'reset') return initial();
+  const s = {...state, reviews:{...state.reviews}};
+  const reject = why => ({...s, message:'Rejected: ' + why});
+  const step = next(s)[0];
+  if (action === 'hold') return {...s, hold:!s.hold, message:s.hold ? 'Owner removed the hold.' : 'Owner applied a hold. In-flight effects cannot be undone; new handoffs stop.'};
+  if (s.hold || s.failures >= 2) return reject(next(s)[1]);
+  if (action === 'plan') {
+    if (step !== 'Plan') return reject('the Issue already has a plan.');
+    s.planned = true;
+  } else if (action === 'specify') {
+    if (step !== 'Specify') return reject('settle the plan first.');
+    s.specified = true;
+  } else if (action === 'setup') {
+    if (step !== 'Check setup') return reject('finish the Issue specification first.');
+    s.capabilities = true;
+  } else if (action === 'commit') {
+    if (!s.capabilities || s.released) return reject('setup must pass, and a released change needs a new Issue.');
+    s.revision += 1;
+    s.head = (s.folded ? 'build-' : 'candidate-') + s.revision;
+    s.checks = 'missing'; s.reviews = {}; s.releaseRequested = false;
+  } else if (action === 'pass' || action === 'fail') {
+    if (!s.head || s.released) return reject('there is no unreleased commit to check.');
+    s.checks = action === 'pass' ? s.head : 'failed';
+    if (action === 'fail') s.failures += 1;
+  } else if (axes.includes(action)) {
+    if (s.checks !== s.head || !s.head || s.released) return reject('verify the current unreleased commit first.');
+    s.reviews[action] = s.head;
+  } else if (action === 'old-review') {
+    if (!s.head) return reject('there is no candidate.');
+    s.reviews['Ponytail Ultra'] = 'old-commit';
+  } else if (action === 'fold') {
+    if (step !== 'Request integration') return reject('the steward needs passing checks and three fresh reviews.');
+    s.folded = true; s.revision += 1; s.head = 'build-' + s.revision;
+    s.checks = 'missing'; s.reviews = {};
+  } else if (action === 'request') {
+    if (step !== 'Request release') return reject('the integrated result is not ready for release.');
+    s.releaseRequested = true;
+  } else if (action === 'release') {
+    if (!s.releaseRequested || step !== 'Request release') return reject('a request plus current integrated evidence is required.');
+    s.released = true;
+  } else if (action === 'agent-release') {
+    return reject('the agent has no protected-write credential. Only the executor can publish.');
+  } else if (action === 'delivery-pass' || action === 'delivery-fail') {
+    if (!s.released) return reject('nothing has been released.');
+    s.delivery = action === 'delivery-pass' ? 'passed' : 'failed';
+  } else return reject('unknown action.');
+  s.message = action === 'fold' ? 'Integrated: the build has a new commit. Check and review that result too.'
+    : action === 'request' ? 'Release requested. Nothing is published yet.'
+    : action === 'commit' ? 'New commit: earlier checks, reviews and release requests no longer apply.'
+    : 'Recorded: ' + action + '.';
+  return s;
+}
+</script>
+<script>
+const labels = {reset:'Reset demo', plan:'Settle plan', specify:'Mark Issue ready', setup:'Verify tools',
+  commit:'Create / change commit', pass:'Checks pass', fail:'Checks fail',
+  Standards:'Standards approves', Spec:'Spec approves', 'Ponytail Ultra':'Ponytail Ultra approves',
+  'old-review':'Submit stale review', fold:'Steward integrates', request:'Tend requests release',
+  release:'Executor publishes', 'agent-release':'Agent tries to publish',
+  'delivery-pass':'Live verification passes', 'delivery-fail':'Live verification fails', hold:'Owner toggles hold'};
+const prepared = ['plan','specify','setup','commit','pass',...axes];
+const integrated = [...prepared,'fold','pass',...axes];
+const scenarios = [
+  ['All the way through', 'Watch the second review after integration. A release request does not publish anything.', [...integrated,'request','release','delivery-pass']],
+  ['Owner hold', 'Apply a hold to a ready candidate. The steward refuses it until the owner removes the hold.', [...prepared,'hold','fold','hold','fold']],
+  ['Stale review', 'Change a reviewed commit, then submit an old approval. Integration must still refuse.', [...prepared,'commit','pass','Standards','Spec','old-review','fold','Ponytail Ultra','fold']],
+  ['Failed checks', 'An approval cannot make failing checks disappear. Repair, verify and review again.', ['plan','specify','setup','commit','fail','Standards','fold','commit','pass',...axes,'fold']],
+  ['Retry ceiling', 'Two failed attempts stop the loop. It does not keep spending or silently reset its budget.', ['plan','specify','setup','commit','fail','commit','fail','commit','pass']],
+  ['Release authority', 'An agent cannot publish; a premature executor call fails too. A later live failure is not success.', [...integrated,'agent-release','release','request','release','delivery-fail']]
+];
+let state = initial(), scenarioIndex = 0, stepIndex = 0;
+const byId = id => document.getElementById(id);
+function button(text, click) { const b = document.createElement('button'); b.textContent=text; b.onclick=click; return b; }
+function dispatch(action) { state=transition(state,action); render(); }
+function render() {
+  const [role,reason] = next(state);
+  byId('next').textContent=role; byId('reason').textContent=reason;
+  byId('message').textContent=state.message;
+  const fields = {Plan:state.planned?'Settled':'Missing', Issue:state.specified?'Ready':'Not specified',
+    Tools:state.capabilities?'Verified (simulated)':'Not checked', Hold:state.hold?'Active':'None',
+    Commit:state.head||'None', Checks:state.checks,
+    ...Object.fromEntries(axes.map(a=>[a,state.reviews[a]||'Missing'])),
+    Integration:state.folded?'On build branch':'Not integrated',
+    'Release request':state.releaseRequested?'Submitted':'None',
+    Release:state.released?'Published':'Not published', 'Live result':state.delivery,
+    'Failed attempts':state.failures+' / 2', 'Agent release access':'Never'};
+  byId('state').replaceChildren();
+  for(const [key,value] of Object.entries(fields)) {
+    const group=document.createElement('div'), term=document.createElement('dt'), val=document.createElement('dd');
+    term.textContent=key; val.textContent=value; group.append(term,val); byId('state').append(group);
+  }
+}
+for(const [action,label] of Object.entries(labels)) byId('actions').append(button(label,()=>dispatch(action)));
+function selectScenario(index) {
+  state=initial(); scenarioIndex=index; stepIndex=0;
+  for(const [i,tab] of [...byId('tabs').children].entries()) tab.setAttribute('aria-selected',String(i===index));
+  byId('scenario').textContent=scenarios[index][1]; renderSteps(); render();
+}
+function renderSteps() {
+  byId('steps').replaceChildren();
+  scenarios[scenarioIndex][2].forEach((action,index)=>{
+    const row=document.createElement('li');
+    const b=button((index<stepIndex?'✓ ':'')+labels[action],()=>{dispatch(action); stepIndex=index+1; renderSteps();});
+    b.disabled=index!==stepIndex; row.append(b); byId('steps').append(row);
+  });
+}
+scenarios.forEach(([name],index)=>{
+  const b=button(name,()=>selectScenario(index)); b.setAttribute('role','tab');
+  b.setAttribute('aria-controls','walkthrough'); byId('tabs').append(b);
+});
+selectScenario(0);
+</script>
+</body>
+</html>
