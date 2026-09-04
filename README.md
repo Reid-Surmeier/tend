@@ -1,5 +1,9 @@
 <h1><img src="assets/logo-512.png" alt="tend logo" width="50" align="absmiddle">Tend</h1>
 
+This fork adds [opt-in engineering lifecycle coordination](docs/lifecycle.md)
+on top of Tend 0.1.24. Adopter activation and live execution must be verified
+separately; the upstream introduction follows.
+
 [![PyPI](https://img.shields.io/pypi/v/tend?style=for-the-badge&logo=pypi&logoColor=white)](https://pypi.org/project/tend/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](https://opensource.org/licenses/MIT)
 [![CI](https://img.shields.io/github/actions/workflow/status/max-sixty/tend/ci.yaml?event=push&branch=main&style=for-the-badge&logo=github)](https://github.com/max-sixty/tend/actions?query=branch%3Amain+workflow%3Aci)

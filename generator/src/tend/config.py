@@ -28,6 +28,7 @@ KNOWN_WORKFLOWS = {
     # install-test is opt-in via `tend init --with-install-test` but still
     # honors workflow_extra / jobs overrides from .config/tend.yaml.
     "install-test",
+    "lifecycle",
 }
 KNOWN_TOP_LEVEL = {
     "bot_name",
@@ -42,6 +43,7 @@ KNOWN_TOP_LEVEL = {
     "sandbox_env",
     "sandbox_path",
     "workflows",
+    "action_source",
 }
 KNOWN_HARNESSES = {"claude", "codex"}
 KNOWN_SECRETS_KEYS = {"allowed"}
@@ -210,6 +212,8 @@ class Config:
     # in a bot-owned secret Gist. The Gist ID stays in a fixed environment
     # secret so a public repository does not publish the unlisted URL.
     memory_gist: bool = False
+    # A reviewed fork, shared by the generator and harness/plugin checkout.
+    action_source: str = ""
 
     def enabled_harnesses(self) -> set[str]:
         """Harnesses used by the workflows a normal regeneration emits."""
@@ -291,6 +295,17 @@ class Config:
         memory_gist = raw.get("memory_gist", False)
         if not isinstance(memory_gist, bool):
             raise click.ClickException("memory_gist must be true or false")
+
+        action_source = raw.get("action_source", "")
+        if not isinstance(action_source, str) or (
+            action_source
+            and not re.fullmatch(
+                r"[A-Za-z0-9-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}", action_source
+            )
+        ):
+            raise click.ClickException(
+                "action_source must be owner/repo@<full lowercase commit SHA>"
+            )
 
         unknown = set(raw.keys()) - KNOWN_TOP_LEVEL
         for key in sorted(unknown):
@@ -447,6 +462,10 @@ class Config:
 
         workflows: dict[str, WorkflowConfig] = {}
         for name, wf_raw in (raw.get("workflows") or {}).items():
+            if name == "lifecycle" and not isinstance(wf_raw, (dict, bool)):
+                raise click.ClickException(
+                    "workflows.lifecycle must be a mapping or boolean"
+                )
             if name == "renovate":
                 raise click.ClickException(
                     "workflows.renovate has been renamed to workflows.weekly"
@@ -602,6 +621,16 @@ class Config:
             else:
                 workflows[name] = WorkflowConfig(enabled=bool(wf_raw))
 
+        lifecycle = workflows.get("lifecycle", WorkflowConfig(enabled=False))
+        if type(lifecycle.enabled) is not bool:
+            raise click.ClickException(
+                "workflows.lifecycle.enabled must be true or false"
+            )
+        if lifecycle.enabled and not action_source:
+            raise click.ClickException(
+                "lifecycle requires action_source pinned to the fork commit"
+            )
+
         # The sandbox_* levers reach inside the Claude proxy sandbox and
         # no-op under codex (whose agent runs on the runner, already reachable
         # via `setup:`). Warn only when they'd be fully inert — i.e. no enabled
@@ -664,14 +693,15 @@ class Config:
             memory_gist=memory_gist,
             workflows=workflows,
             allowed_repo_secrets=allowed,
+            action_source=action_source,
         )
 
 
 def _enabled_harnesses(harness: str, workflows: dict[str, WorkflowConfig]) -> set[str]:
     """Effective harnesses of enabled, normally generated workflows."""
     enabled = set()
-    for name in STANDARD_WORKFLOWS:
-        workflow = workflows.get(name, WorkflowConfig())
+    for name in STANDARD_WORKFLOWS | {"lifecycle"}:
+        workflow = workflows.get(name, WorkflowConfig(enabled=name != "lifecycle"))
         if not workflow.enabled:
             continue
         if name == "ci-fix" and workflow.watched_workflows is None:

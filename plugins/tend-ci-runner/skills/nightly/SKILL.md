@@ -34,6 +34,11 @@ The script prints `key=value` lines. Act on `STATUS`:
 Run `tend check` to verify this repo's tend setup (branch protection, bot
 permission, and where credentials live):
 
+If `.config/tend.yaml` sets `action_source: OWNER/REPO@SHA`, use
+`uvx --from 'git+https://github.com/OWNER/REPO@SHA#subdirectory=generator' tend check`
+with that exact source instead of the upstream command below. The same pinned
+generator owns both the workflows and their prerequisite checks.
+
 ```bash
 uv tool run tend@latest check 2>&1 | tee /tmp/tend-check.txt
 ```
@@ -147,6 +152,11 @@ Used by both Step 4 (applied to recent diffs) and Step 6 (applied to full files)
 - Skills that have drifted from actual project behavior (instructions that no longer match how the code works)
 
 ## Step 7: Update tend workflows
+
+For a configured `action_source`, regenerate with the same pinned fork command
+from step 2, replacing `check` with `init`. Keep the pin unchanged; upgrading
+the fork is separate reviewed work. Do not run the upstream `tend@latest`
+command below for a fork: it would remove fork-only workflows.
 
 Regenerate the tend workflow files and open a PR if anything changed. The checkout's `.github/` directory may be mounted read-only under the sandbox (protecting bots from modifying their own workflows in place), so do the regeneration in a git worktree under `/tmp`, which is writable. Use the literal path `/tmp/tend-update-workflows` — GitHub Actions runners leave `$TMPDIR` unset, so a `$TMPDIR/...` path expands to an unwritable root path.
 

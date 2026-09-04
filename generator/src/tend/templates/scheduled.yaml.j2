@@ -4,10 +4,28 @@ on:
   schedule:
     - cron: "<<cron>>"
   workflow_dispatch:
+{% if name == 'lifecycle' %}
+  issues:
+    types: [opened, labeled, unlabeled, reopened]
+  pull_request_target:
+    types: [opened, synchronize, closed]
+{% if cfg.workflows[name].watched_workflows %}
+  workflow_run:
+    workflows: <<cfg.workflows[name].watched_workflows|tojson>>
+    types: [completed]
+{% endif %}
+
+concurrency:
+  group: tend-lifecycle
+  cancel-in-progress: false
+{% endif %}
 
 jobs:
   <<name>>:
 <<fork_guard_if(cfg)>>    runs-on: ubuntu-24.04
+{% if name == 'lifecycle' %}
+    timeout-minutes: 60
+{% endif %}
 <<environment()>>
     permissions:
 <<permissions()>>
