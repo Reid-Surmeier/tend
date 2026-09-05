@@ -58,6 +58,20 @@ post-release verification is unfinished work.
 
 ## Evidence and limitations
 
+The Claude action accepts `metadata_only: "true"` for private-context runs.
+It disables native session persistence, discards stderr, filters stdout before
+writing it, and publishes only structural native launch/return events and numeric
+usage. Agent-written summaries and session-log artifacts are not published;
+`show_full_output` cannot override this mode, and Gist memory is incompatible.
+Malformed or over-4-MiB records fail the capture. Interrupted usage without a
+final cost record is marked partial with unknown cost, never a free run.
+
+This minimizes Tend-managed diagnostics, not the agent's other tools: adopter
+setup must not print private context, and the agent must not post it to an Issue
+or write it into repository artifacts. Native event metadata does not establish
+review correctness or protected-write authorization. Qualify with dummy context
+on the actual pinned runtime before admitting a private service.
+
 The [throwaway prototype](https://github.com/Reid-Surmeier/tend/blob/510e4b71ad743b85411d277b991a3b36bfd1a8a2/generator/prototype-lifecycle-203.html)
 is archived outside production. Its six browser walkthroughs and eight targeted
 rejection checks exercise the handoff model, not live agent execution. The HTML

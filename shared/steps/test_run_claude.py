@@ -11,11 +11,13 @@ is a file or a scalar — so each branch is reachable from a fixture.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import signal
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +87,125 @@ def verdict(
         return code, capsys.readouterr().out, github_files.summary.read_text()
 
     return go
+
+
+def test_metadata_capture_drops_content_and_keeps_native_events() -> None:
+    canary = "PRIVATE_CONTEXT_CANARY"
+    events = [
+        {
+            "type": "assistant",
+            "session_id": "00000000-0000-4000-8000-000000000001",
+            "message": {
+                "content": [
+                    {"type": "text", "text": canary},
+                    {
+                        "type": "tool_use",
+                        "name": "Agent",
+                        "id": "toolu_0123456789abcdefghijklm",
+                        "input": {"prompt": canary},
+                    },
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_0123456789abcdefghijklm",
+                        "content": canary,
+                    }
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": canary,
+            "num_turns": 2,
+            "total_cost_usd": 0.2,
+            "usage": {"input_tokens": 12, "output_tokens": 34, "private": canary},
+        },
+    ]
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()), output
+    )
+    assert canary.encode() not in output.getvalue()
+    captured = list(map(json.loads, output.getvalue().splitlines()))
+    assert captured[0]["message"]["content"][0]["name"] == "Agent"
+    assert (
+        captured[1]["message"]["content"][0]["tool_use_id"]
+        == "toolu_0123456789abcdefghijklm"
+    )
+    assert captured[-1]["usage"] == {"input_tokens": 12, "output_tokens": 34}
+    assert run_claude.turn_outcome(captured) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"broken",
+        b"[]",
+        b"x" * (4 * 1024 * 1024 + 1),
+        b'{"type":"result","subtype":"PRIVATE_CONTEXT_CANARY"}',
+    ],
+    ids=["malformed", "wrong-shape", "oversized", "unknown-result"],
+)
+def test_metadata_capture_fails_closed_without_quoting_bad_records(
+    payload: bytes,
+) -> None:
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO(payload + b"\n" + _ev_result().encode()), output
+    )
+    assert b"PRIVATE_CONTEXT_CANARY" not in output.getvalue()
+    assert (
+        run_claude.turn_outcome(map(json.loads, output.getvalue().splitlines()))
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "bad",
+        {"content": 123},
+        {"content": [{"type": "tool_use", "name": "Agent", "id": 123}]},
+    ],
+    ids=["message", "content", "native-id"],
+)
+def test_metadata_rejects_malformed_native_events_even_before_success(
+    message: object,
+) -> None:
+    output = io.BytesIO()
+    stream = json.dumps({"type": "assistant", "message": message}) + "\n" + _ev_result()
+    run_claude.capture_metadata(io.BytesIO(stream.encode()), output)
+    assert (
+        run_claude.turn_outcome(map(json.loads, output.getvalue().splitlines()))
+        is not None
+    )
+
+
+def test_metadata_supervisor_never_records_child_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(run_claude, "signal_sandbox", lambda *args: None)
+    stream, stderr = tmp_path / "stream", tmp_path / "stderr"
+    script = 'import sys; print(\'{"type":"result","subtype":"success","is_error":false,"result":"PRIVATE_CONTEXT_CANARY"}\'); print("PRIVATE_CONTEXT_CANARY", file=sys.stderr)'
+    result = run_claude.supervise(
+        [sys.executable, "-c", script],
+        sandbox="unused",
+        timeout_sec=3,
+        stream_json=stream,
+        stderr_log=stderr,
+        metadata_only=True,
+    )
+    assert result.exit_code == 0
+    assert b"PRIVATE_CONTEXT_CANARY" not in stream.read_bytes()
+    assert not stderr.exists() or stderr.read_bytes() == b""
 
 
 def test_verdict_reports_a_crash_that_left_no_assistant_text(verdict: Verdict) -> None:
@@ -497,9 +618,13 @@ def launch(
             calls.append(Recorded(list(argv), kwargs))
             if launch_error is not None:
                 raise launch_error
-            kwargs["stdout"].write(stream.encode())
+            agent = FakeAgent(calls, returncode, timed_out, term_ends_it)
+            if kwargs["stdout"] == subprocess.PIPE:
+                agent.stdout = io.BytesIO(stream.encode())
+            else:
+                kwargs["stdout"].write(stream.encode())
             kwargs["stderr"].write(stderr_text.encode())
-            return FakeAgent(calls, returncode, timed_out, term_ends_it)
+            return agent
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -520,6 +645,39 @@ def launch(
         )
 
     return go
+
+
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_metadata_launch_disables_persistence_and_all_text_diagnostics(
+    launch: Launcher, returncode: int
+) -> None:
+    result = launch(
+        stream=_ev_text("PRIVATE_CONTEXT_CANARY") + "\n" + _ev_result(),
+        stderr_text="PRIVATE_CONTEXT_CANARY",
+        returncode=returncode,
+        TEND_METADATA_ONLY="true",
+        SHOW_FULL_OUTPUT="true",
+    )
+    assert "--no-session-persistence" in result.command("claude").argv
+    assert (
+        "PRIVATE_CONTEXT_CANARY"
+        not in result.out + result.summary + result.stream_json.read_text()
+    )
+    assert result.code == returncode
+
+
+def test_metadata_timeout_is_not_success_and_keeps_no_text(launch: Launcher) -> None:
+    result = launch(
+        stream=_ev_text("PRIVATE_CONTEXT_CANARY"),
+        stderr_text="PRIVATE_CONTEXT_CANARY",
+        timed_out=True,
+        TEND_METADATA_ONLY="true",
+    )
+    assert result.code != 0 and "exceeded" in result.out
+    assert (
+        "PRIVATE_CONTEXT_CANARY"
+        not in result.out + result.summary + result.stream_json.read_text()
+    )
 
 
 def test_launch_steers_the_agent_entirely_through_argv(launch: Launcher) -> None:

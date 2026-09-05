@@ -63,6 +63,49 @@ CONTEXT_KEYS = (
 GITHUB_FILE_VARS = ("GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_STEP_SUMMARY")
 
 
+def test_metadata_mode_never_consolidates_session_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEND_METADATA_ONLY", "true")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv("AGENT_HOME", str(tmp_path / "agent"))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "max-sixty/tend")
+    stream = _ndjson(
+        tmp_path / "stream.json",
+        [
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "usage": {"input_tokens": 12},
+                "num_turns": 2,
+                "total_cost_usd": 0.2,
+            }
+        ],
+    )
+    monkeypatch.setenv("STREAM_JSON", str(stream))
+    copied = []
+    monkeypatch.setattr(token_usage, "best_effort", lambda *args: copied.append(args))
+    usage, logs = token_usage.claude_step("opus")
+    assert copied == [], "metadata mode must not copy raw session/stderr logs"
+    assert logs == tmp_path / "tend-metadata"
+    assert usage["input_tokens"] == 12 and usage["cost_usd"] == 0.2
+
+
+def test_metadata_interruption_reports_incomplete_counts_not_session_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEND_METADATA_ONLY", "true")
+    monkeypatch.setenv("RUNNER_TEMP", str(tmp_path))
+    monkeypatch.setenv(
+        "STREAM_JSON", str(_ndjson(tmp_path / "stream.json", [{"type": "assistant"}]))
+    )
+    usage, _ = token_usage.claude_step("opus")
+    summary = token_usage.render_summary(usage, harness="claude")
+    assert usage["partial"] is True and usage["cost_usd"] is None
+    assert "lower bounds" in summary and "session log" not in summary.lower()
+
+
 def _assistant(msg_id: str, usage: dict[str, int], *, final: bool) -> dict[str, object]:
     return {
         "type": "assistant",

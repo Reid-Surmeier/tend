@@ -31,15 +31,18 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
+import re
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, BinaryIO
 
 import _common
 import _sandbox
@@ -102,6 +105,7 @@ def launch_argv(
     bot_id: str,
     ci: str,
     settings_file: str = "",
+    metadata_only: bool = False,
 ) -> list[str]:
     """The command that launches the agent as the non-sudo sandbox user.
 
@@ -151,6 +155,8 @@ def launch_argv(
     ]
     if settings_file:
         argv.extend(["--settings", settings_file])
+    if metadata_only:
+        argv.append("--no-session-persistence")
     argv.append(prompt)
     return argv
 
@@ -217,6 +223,119 @@ def signal_sandbox(name: str, sandbox: str) -> None:
     )
 
 
+def capture_metadata(source: BinaryIO, target: BinaryIO) -> None:
+    """Allowlist structural events before writing; never persist model text.
+
+    A malformed or oversized record makes the entire capture unsuccessful.
+    # ponytail: 4 MiB per record; increase only for a measured legitimate event.
+    """
+    limit = 4 * 1024 * 1024
+    failed = False
+    tool_id = re.compile(r"toolu_[A-Za-z0-9]{10,64}\Z")
+    session_id = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+    try:
+        while line := source.readline(limit + 1):
+            if len(line) > limit:
+                failed = True
+                while line and not line.endswith(b"\n"):
+                    line = source.readline(limit + 1)
+                continue
+            try:
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise TypeError
+                kind = event.get("type")
+                record: dict[str, Any] = {"type": kind}
+                if kind == "result":
+                    success = (
+                        event.get("subtype") == "success"
+                        and event.get("is_error") is False
+                    )
+                    failed |= not success
+                    record.update(
+                        subtype="success" if success else "error", is_error=not success
+                    )
+                    for key in ("num_turns", "total_cost_usd"):
+                        value = event.get(key)
+                        if (
+                            type(value) in (int, float)
+                            and math.isfinite(value)
+                            and 0 <= value <= 10**15
+                        ):
+                            record[key] = value
+                    usage = event.get("usage")
+                    record["usage"] = {
+                        key: value
+                        for key, value in (
+                            usage.items() if isinstance(usage, dict) else ()
+                        )
+                        if key
+                        in {
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_creation_input_tokens",
+                            "cache_read_input_tokens",
+                        }
+                        and type(value) is int
+                        and 0 <= value <= 10**15
+                    }
+                elif kind in ("assistant", "user"):
+                    message = event.get("message")
+                    if not isinstance(message, dict):
+                        raise TypeError
+                    blocks = message.get("content")
+                    if kind == "user" and isinstance(blocks, str):
+                        continue
+                    if not isinstance(blocks, list):
+                        raise TypeError
+                    kept = []
+                    for block in blocks:
+                        if not isinstance(block, dict):
+                            raise TypeError
+                        if (
+                            kind == "assistant"
+                            and block.get("type") == "tool_use"
+                            and block.get("name") in ("Agent", "Task")
+                        ):
+                            value = block.get("id")
+                            if not isinstance(value, str) or not tool_id.fullmatch(
+                                value
+                            ):
+                                raise ValueError
+                            kept.append(
+                                {"type": "tool_use", "name": block["name"], "id": value}
+                            )
+                        elif kind == "user" and block.get("type") == "tool_result":
+                            value = block.get("tool_use_id")
+                            if (
+                                not isinstance(value, str)
+                                or not tool_id.fullmatch(value)
+                                or type(block.get("is_error", False)) is not bool
+                            ):
+                                raise ValueError
+                            kept.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": value,
+                                    "is_error": block.get("is_error", False),
+                                }
+                            )
+                    if not kept:
+                        continue
+                    record["message"] = {"content": kept}
+                else:
+                    continue
+                value = event.get("session_id")
+                if isinstance(value, str) and session_id.fullmatch(value):
+                    record["session_id"] = value
+                target.write(json.dumps(record, allow_nan=False).encode() + b"\n")
+            except (ValueError, TypeError, OverflowError, RecursionError):
+                failed = True
+    finally:
+        if failed:
+            target.write(b'{"type":"result","subtype":"error","is_error":true}\n')
+
+
 def supervise(
     argv: list[str],
     *,
@@ -224,6 +343,7 @@ def supervise(
     timeout_sec: int,
     stream_json: Path,
     stderr_log: Path,
+    metadata_only: bool = False,
 ) -> Supervised:
     """Run *argv* under the bound, capturing its streams to runner-owned files.
 
@@ -255,15 +375,33 @@ def supervise(
     """
     start = time.monotonic()
     agent: subprocess.Popen[bytes] | None = None
+    capture: threading.Thread | None = None
+    captured = []
     try:
         with (
             raise_on_cancel(),
             stream_json.open("wb") as out,
-            stderr_log.open("wb") as err,
+            open(os.devnull, "wb") if metadata_only else stderr_log.open("wb") as err,
         ):
             agent = subprocess.Popen(
-                argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE if metadata_only else out,
+                stderr=err,
             )
+            if metadata_only:
+                assert agent.stdout is not None
+
+                def collect() -> None:
+                    try:
+                        capture_metadata(agent.stdout, out)
+                    except OSError:
+                        # Never quote a capture exception that may contain input.
+                        return
+                    captured.append(True)
+
+                capture = threading.Thread(target=collect)
+                capture.start()
             try:
                 returncode = agent.wait(timeout_sec)
                 # Shell convention: 128 + N when signal N killed the child.
@@ -277,6 +415,15 @@ def supervise(
                 # `sudo` exits once its child does, so this observes the agent.
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     agent.wait(TERM_GRACE_SEC)
+            finally:
+                # Reap before joining so no surviving child can hold the pipe open.
+                if capture is not None:
+                    signal_sandbox("KILL", sandbox)
+                    agent.wait()
+                    capture.join()
+                    agent.stdout.close()
+                    if not captured:
+                        raise RuntimeError("Runtime metadata capture failed")
     finally:
         signal_sandbox("KILL", sandbox)
         if agent is not None:
@@ -419,12 +566,13 @@ def verdict(
     stderr_log: Path,
     timeout_sec: str,
     show_full_output: str,
+    metadata_only: bool = False,
 ) -> int:
     """The step's exit code, with the annotation and job summary that explain it.
 
     ``claude_exit`` is None exactly when the bound killed the run.
     """
-    if show_full_output == "true":
+    if show_full_output == "true" and not metadata_only:
         lines = transcript(stream_events(stream_json), TRANSCRIPT_MAX_LINES)
         if lines:
             _common.append_summary(
@@ -435,25 +583,32 @@ def verdict(
         return _common.fail(f"Claude headless run exceeded {timeout_sec}s timeout")
 
     if claude_exit:
-        reason = failure_reason(stream_events(stream_json))
+        reason = "" if metadata_only else failure_reason(stream_events(stream_json))
         named = f": {reason}" if reason else ""
+        artifact = "runtime metadata" if metadata_only else "session-logs artifact"
         _common.annotate(
             "error",
             f"claude -p exited non-zero (exit={claude_exit}){named}"
-            " — see the session-logs artifact",
+            f" — see the {artifact}",
         )
-        _quote_stderr(stderr_log)
+        if not metadata_only:
+            _quote_stderr(stderr_log)
         return claude_exit
 
     why = turn_outcome(stream_events(stream_json))
     if why is None:
         return 0
     _common.annotate("error", f"claude -p {why}")
-    _quote_stderr(stderr_log)
+    if not metadata_only:
+        _quote_stderr(stderr_log)
     return 1
 
 
 def main() -> int:
+    mode = os.environ.get("TEND_METADATA_ONLY", "false")
+    if mode not in ("true", "false"):
+        raise SystemExit("TEND_METADATA_ONLY must be true or false")
+    metadata_only = mode == "true"
     env = _common.require_env(
         "SANDBOX",
         "AGENT_ENV_FILE",
@@ -513,6 +668,7 @@ def main() -> int:
         bot_id=env["BOT_ID"],
         ci=os.environ.get("CI") or "true",
         settings_file=os.environ.get("TEND_AUTO_MEMORY_SETTINGS", ""),
+        metadata_only=metadata_only,
     )
     # Published before the launch: the path does not depend on the run, and the
     # steps that read it — Token usage, the session-logs artifact — are
@@ -526,6 +682,7 @@ def main() -> int:
             timeout_sec=int(env["TEND_TIMEOUT_SEC"]),
             stream_json=stream_json,
             stderr_log=stderr_log,
+            metadata_only=metadata_only,
         )
     finally:
         # supervise() kills and reaps the sandbox uid on every exit, including
@@ -546,6 +703,7 @@ def main() -> int:
         stderr_log=stderr_log,
         timeout_sec=env["TEND_TIMEOUT_SEC"],
         show_full_output=env["SHOW_FULL_OUTPUT"],
+        metadata_only=metadata_only,
     )
 
 

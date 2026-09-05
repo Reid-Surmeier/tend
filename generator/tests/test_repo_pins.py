@@ -54,6 +54,30 @@ def test_claude_transcript_summary_is_opt_in() -> None:
     assert action["inputs"]["show_full_output"]["default"] == "false"
 
 
+def test_metadata_mode_gates_every_agent_content_publisher() -> None:
+    action = YAML(typ="safe", pure=True).load(
+        (REPO_ROOT / "claude/action.yaml").read_text()
+    )
+    steps = {step["name"]: step for step in action["runs"]["steps"]}
+    assert action["inputs"]["metadata_only"]["default"] == "false"
+    for name in (
+        "Append skill step summary",
+        "Upload session logs",
+        "Restore experimental memory Gist",
+    ):
+        assert "inputs.metadata_only == 'false'" in steps[name]["if"]
+    for name in ("Run Claude", "Token usage"):
+        assert steps[name]["env"]["TEND_METADATA_ONLY"] == "${{ inputs.metadata_only }}"
+    assert (
+        steps["Upload runtime metadata"]["with"]["path"]
+        == "${{ runner.temp }}/tend-metadata/"
+    )
+    assert (
+        steps["Upload runtime metadata"]["if"]
+        == "always() && inputs.metadata_only == 'true'"
+    )
+
+
 def test_experimental_memory_gist_sync_cannot_replace_the_agent_verdict() -> None:
     action = YAML(typ="safe", pure=True).load(
         (REPO_ROOT / "claude" / "action.yaml").read_text()
