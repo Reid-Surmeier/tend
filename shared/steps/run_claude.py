@@ -343,6 +343,15 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                                     isinstance(text, str) and probe in text
                                     for text in texts
                                 )
+                                kept[-1]["probe_text_bytes"] = (
+                                    sum(
+                                        len(text.encode())
+                                        for text in texts
+                                        if isinstance(text, str)
+                                    )
+                                    if kept[-1]["probe_seen"]
+                                    else 0
+                                )
                     if not kept:
                         continue
                     record["message"] = {"content": kept}

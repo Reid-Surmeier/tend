@@ -81,6 +81,10 @@ and launch prompts. Require correlated successful native returns and a successfu
 final result with these booleans true, then verify the canary is absent from
 retained diagnostics. An absent canary alone is not positive proof of suppression.
 Never point this qualification input at real private context or credentials.
+Tool returns also carry `probe_text_bytes`, the observed UTF-8 text size when
+the probe was present (zero otherwise). Use it to qualify representative-sized
+responses; supplied counts are ignored. It does not establish file-free native
+I/O: the adopter must inspect native temporary/output paths after execution.
 
 The [throwaway prototype](https://github.com/Reid-Surmeier/tend/blob/510e4b71ad743b85411d277b991a3b36bfd1a8a2/generator/prototype-lifecycle-203.html)
 is archived outside production. Its six browser walkthroughs and eight targeted

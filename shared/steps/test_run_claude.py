@@ -210,6 +210,47 @@ def test_metadata_probe_cannot_qualify_an_interrupted_or_malformed_stream() -> N
         assert run_claude.turn_outcome(captured) is not None
 
 
+@pytest.mark.parametrize("shape", ["string", "blocks", "absent", "disabled"])
+def test_metadata_probe_size_is_observed_utf8_text_not_a_supplied_count(
+    shape: str,
+) -> None:
+    probe = "a" * 64
+    text = "é" * 8192 + (probe if shape != "absent" else "")
+    content = (
+        [{"type": "text", "text": text}, {"type": "image", "text": probe}]
+        if shape == "blocks"
+        else text
+    )
+    event = {
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_0123456789abcdefghijklm",
+                    "content": content,
+                    "probe_text_bytes": 999999,
+                    "probe_seen": True,
+                }
+            ]
+        },
+    }
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO(json.dumps(event).encode()),
+        output,
+        probe="" if shape == "disabled" else probe,
+    )
+    record = json.loads(output.getvalue())["message"]["content"][0]
+    if shape == "disabled":
+        assert "probe_text_bytes" not in record
+    else:
+        assert record["probe_text_bytes"] == (
+            len(text.encode()) if shape != "absent" else 0
+        )
+    assert probe.encode() not in output.getvalue()
+
+
 def test_metadata_probe_in_a_structural_id_fails_without_retention() -> None:
     probe = "a" * 64
     event = {
