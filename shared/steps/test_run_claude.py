@@ -89,6 +89,49 @@ def verdict(
     return go
 
 
+@pytest.mark.parametrize(
+    "parent",
+    [
+        None,
+        "toolu_0123456789abcdefghijklm",
+        "missing",
+        "bad",
+        4,
+        [],
+        "toolu_" + "a" * 64,
+    ],
+)
+def test_metadata_retains_only_valid_observed_parent_lineage(parent: Any) -> None:
+    event = {
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_0123456789abcdefghijklm",
+                    "is_error": False,
+                    "content": "synthetic only",
+                }
+            ]
+        },
+    }
+    if parent != "missing":
+        event["parent_tool_use_id"] = parent
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO((json.dumps(event) + "\n").encode()), output, probe="a" * 64
+    )
+    records = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert b"synthetic only" not in output.getvalue()
+    assert b"a" * 64 not in output.getvalue()
+    if parent in (None, "toolu_0123456789abcdefghijklm"):
+        assert records[0]["parent_tool_use_id"] == parent
+    elif parent == "missing":
+        assert "parent_tool_use_id" not in records[0]
+    else:
+        assert records == [{"type": "result", "subtype": "error", "is_error": True}]
+
+
 def test_metadata_capture_drops_content_and_keeps_native_events() -> None:
     canary = "PRIVATE_CONTEXT_CANARY"
     events = [

@@ -85,6 +85,12 @@ Tool returns also carry `probe_text_bytes`, the observed UTF-8 text size when
 the probe was present (zero otherwise). Use it to qualify representative-sized
 responses; supplied counts are ignored. It does not establish file-free native
 I/O: the adopter must inspect native temporary/output paths after execution.
+Retained message events also preserve validated `parent_tool_use_id` values:
+explicit null means a root event, while a tool ID identifies the spawning
+native call ([native message contract](https://code.claude.com/docs/en/agent-sdk/subagents)).
+Missing lineage stays missing; malformed lineage refuses capture. This lets a
+consumer correlate observed child tool responses without asking the child to
+regenerate their bodies. Actual runtime lineage still needs qualification.
 
 The [throwaway prototype](https://github.com/Reid-Surmeier/tend/blob/510e4b71ad743b85411d277b991a3b36bfd1a8a2/generator/prototype-lifecycle-203.html)
 is archived outside production. Its six browser walkthroughs and eight targeted

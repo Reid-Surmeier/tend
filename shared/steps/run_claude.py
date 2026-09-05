@@ -355,6 +355,13 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                     if not kept:
                         continue
                     record["message"] = {"content": kept}
+                    if "parent_tool_use_id" in event:
+                        parent = event["parent_tool_use_id"]
+                        if parent is not None and (
+                            not isinstance(parent, str) or not tool_id.fullmatch(parent)
+                        ):
+                            raise ValueError
+                        record["parent_tool_use_id"] = parent
                 else:
                     continue
                 value = event.get("session_id")
