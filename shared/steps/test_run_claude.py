@@ -144,6 +144,99 @@ def test_metadata_capture_drops_content_and_keeps_native_events() -> None:
     assert run_claude.turn_outcome(captured) is None
 
 
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("blocks", [False, True])
+def test_metadata_probe_observes_return_text_not_forged_flags(
+    present: bool,
+    blocks: bool,
+) -> None:
+    probe = "a" * 64
+    text = probe if present else "no synthetic context"
+    events = [
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Agent",
+                        "id": "toolu_0123456789abcdefghijklm",
+                        "input": {"prompt": probe},
+                        "probe_seen": True,
+                    }
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_0123456789abcdefghijklm",
+                        "content": [{"type": "text", "text": text}] if blocks else text,
+                        "probe_seen": True,
+                    }
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": text,
+            "probe_seen": True,
+        },
+    ]
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()),
+        output,
+        probe=probe,
+    )
+    captured = list(map(json.loads, output.getvalue().splitlines()))
+    assert "probe_seen" not in captured[0]["message"]["content"][0]
+    assert captured[1]["message"]["content"][0]["probe_seen"] is present
+    assert captured[-1]["probe_seen"] is present
+    assert probe.encode() not in output.getvalue()
+
+
+def test_metadata_probe_cannot_qualify_an_interrupted_or_malformed_stream() -> None:
+    for payload in (b"", b"broken\n" + _ev_result().encode()):
+        output = io.BytesIO()
+        run_claude.capture_metadata(io.BytesIO(payload), output, probe="a" * 64)
+        captured = list(map(json.loads, output.getvalue().splitlines()))
+        assert not any(event.get("probe_seen") is True for event in captured)
+        assert run_claude.turn_outcome(captured) is not None
+
+
+def test_metadata_probe_in_a_structural_id_fails_without_retention() -> None:
+    probe = "a" * 64
+    event = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "Agent",
+                    "id": "toolu_" + probe,
+                }
+            ]
+        },
+    }
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO((json.dumps(event) + "\n" + _ev_result()).encode()),
+        output,
+        probe=probe,
+    )
+    assert probe.encode() not in output.getvalue()
+    assert (
+        run_claude.turn_outcome(map(json.loads, output.getvalue().splitlines()))
+        is not None
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -678,6 +771,68 @@ def test_metadata_timeout_is_not_success_and_keeps_no_text(launch: Launcher) -> 
         "PRIVATE_CONTEXT_CANARY"
         not in result.out + result.summary + result.stream_json.read_text()
     )
+
+
+def test_metadata_probe_file_reaches_the_supervisor(
+    launch: Launcher, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    probe = "a" * 64
+    (workspace / "probe").write_text(probe + "\n")
+    result = launch(
+        stream=json.dumps(
+            {"type": "result", "subtype": "success", "is_error": False, "result": probe}
+        ),
+        TEND_METADATA_ONLY="true",
+        TEND_METADATA_PROBE_FILE="probe",
+    )
+    assert json.loads(result.stream_json.read_text())["probe_seen"] is True
+    assert probe not in result.out + result.summary + result.stream_json.read_text()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["disabled", "missing", "empty", "oversized", "nonhex", "outside", "directory"],
+)
+def test_metadata_probe_refuses_bad_files_before_launch(
+    kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / "probe"
+    if kind == "outside":
+        path = tmp_path / "outside"
+    if kind == "directory":
+        path.mkdir()
+    elif kind != "missing":
+        path.write_text(
+            {"empty": "", "oversized": "a" * 1000, "nonhex": "private text"}.get(
+                kind, "a" * 64
+            )
+        )
+    monkeypatch.setenv("TEND_METADATA_ONLY", "false" if kind == "disabled" else "true")
+    monkeypatch.setenv("TEND_METADATA_PROBE_FILE", str(path))
+    monkeypatch.setattr(
+        run_claude._common,
+        "require_env",
+        lambda *args: {
+            "SANDBOX": "unused",
+            "GITHUB_WORKSPACE": str(workspace),
+            "RUNNER_TEMP": str(tmp_path),
+        },
+    )
+
+    def refuse_launch(*args: object, **kwargs: object) -> None:
+        pytest.fail("Invalid probe configuration reached a subprocess")
+
+    monkeypatch.setattr(subprocess, "run", refuse_launch)
+    with pytest.raises(
+        SystemExit, match="^Invalid synthetic metadata probe configuration$"
+    ):
+        run_claude.main()
 
 
 def test_launch_steers_the_agent_entirely_through_argv(launch: Launcher) -> None:

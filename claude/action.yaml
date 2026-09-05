@@ -59,6 +59,12 @@ inputs:
       Keep only structural native events and numeric usage in Tend diagnostics.
       Disables native session persistence, stderr capture, transcript/skill summaries
       and session-log uploads. Cannot be combined with memory_gist.
+  metadata_probe_file:
+    default: ""
+    description: >-
+      Qualification only: workspace file containing a synthetic 64-character
+      lowercase hex canary. Requires metadata_only. Capture records only whether
+      return/final text contained it; never use real private data or credentials.
   claude_version:
     default: "2.1.251"
     description: >-
@@ -157,12 +163,16 @@ runs:
         BASH_ENV: ""
         TEND_METADATA_ONLY: ${{ inputs.metadata_only }}
         TEND_MEMORY_GIST: ${{ inputs.memory_gist }}
+        TEND_METADATA_PROBE_FILE: ${{ inputs.metadata_probe_file }}
       run: |
         case "$TEND_METADATA_ONLY" in
           false) ;;
           true) test "$TEND_MEMORY_GIST" = false || { echo 'metadata_only cannot use memory_gist' >&2; exit 1; } ;;
           *) echo 'metadata_only must be true or false' >&2; exit 1 ;;
         esac
+        if test -n "$TEND_METADATA_PROBE_FILE"; then
+          test "$TEND_METADATA_ONLY" = true || { echo 'metadata probe requires metadata_only' >&2; exit 1; }
+        fi
     - name: Security preflight
       id: security
       shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
@@ -411,6 +421,7 @@ runs:
         TEND_TIMEOUT_SEC: ${{ inputs.timeout_seconds }}
         SHOW_FULL_OUTPUT: ${{ inputs.show_full_output }}
         TEND_METADATA_ONLY: ${{ inputs.metadata_only }}
+        TEND_METADATA_PROBE_FILE: ${{ inputs.metadata_probe_file }}
       run: /usr/bin/python3 -E -s "${{ github.action_path }}/../shared/steps/run_claude.py"
 
     # run_claude.py reaps every sandbox process before returning, so this

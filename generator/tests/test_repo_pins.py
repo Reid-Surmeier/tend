@@ -78,6 +78,25 @@ def test_metadata_mode_gates_every_agent_content_publisher() -> None:
     )
 
 
+def test_metadata_probe_is_opt_in_and_reaches_only_the_trusted_supervisor() -> None:
+    action = YAML(typ="safe", pure=True).load(
+        (REPO_ROOT / "claude/action.yaml").read_text()
+    )
+    assert action["inputs"]["metadata_probe_file"]["default"] == ""
+    recipients = {
+        step["name"]
+        for step in action["runs"]["steps"]
+        if "TEND_METADATA_PROBE_FILE" in step.get("env", {})
+    }
+    assert recipients == {"Validate diagnostic mode", "Run Claude"}
+    for step in action["runs"]["steps"]:
+        if step["name"] in recipients:
+            assert (
+                step["env"]["TEND_METADATA_PROBE_FILE"]
+                == "${{ inputs.metadata_probe_file }}"
+            )
+
+
 def test_experimental_memory_gist_sync_cannot_replace_the_agent_verdict() -> None:
     action = YAML(typ="safe", pure=True).load(
         (REPO_ROOT / "claude" / "action.yaml").read_text()

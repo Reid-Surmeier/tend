@@ -223,7 +223,7 @@ def signal_sandbox(name: str, sandbox: str) -> None:
     )
 
 
-def capture_metadata(source: BinaryIO, target: BinaryIO) -> None:
+def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> None:
     """Allowlist structural events before writing; never persist model text.
 
     A malformed or oversized record makes the entire capture unsuccessful.
@@ -255,6 +255,11 @@ def capture_metadata(source: BinaryIO, target: BinaryIO) -> None:
                     record.update(
                         subtype="success" if success else "error", is_error=not success
                     )
+                    if probe:
+                        answer = event.get("result")
+                        record["probe_seen"] = (
+                            isinstance(answer, str) and probe in answer
+                        )
                     for key in ("num_turns", "total_cost_usd"):
                         value = event.get(key)
                         if (
@@ -320,6 +325,24 @@ def capture_metadata(source: BinaryIO, target: BinaryIO) -> None:
                                     "is_error": block.get("is_error", False),
                                 }
                             )
+                            if probe:
+                                content = block.get("content")
+                                texts = (
+                                    [content]
+                                    if isinstance(content, str)
+                                    else [
+                                        part.get("text")
+                                        for part in (
+                                            content if isinstance(content, list) else []
+                                        )
+                                        if isinstance(part, dict)
+                                        and part.get("type") == "text"
+                                    ]
+                                )
+                                kept[-1]["probe_seen"] = any(
+                                    isinstance(text, str) and probe in text
+                                    for text in texts
+                                )
                     if not kept:
                         continue
                     record["message"] = {"content": kept}
@@ -328,7 +351,10 @@ def capture_metadata(source: BinaryIO, target: BinaryIO) -> None:
                 value = event.get("session_id")
                 if isinstance(value, str) and session_id.fullmatch(value):
                     record["session_id"] = value
-                target.write(json.dumps(record, allow_nan=False).encode() + b"\n")
+                encoded = json.dumps(record, allow_nan=False).encode()
+                if probe and probe.encode() in encoded:
+                    raise ValueError
+                target.write(encoded + b"\n")
             except (ValueError, TypeError, OverflowError, RecursionError):
                 failed = True
     finally:
@@ -344,6 +370,7 @@ def supervise(
     stream_json: Path,
     stderr_log: Path,
     metadata_only: bool = False,
+    probe: str = "",
 ) -> Supervised:
     """Run *argv* under the bound, capturing its streams to runner-owned files.
 
@@ -394,7 +421,7 @@ def supervise(
 
                 def collect() -> None:
                     try:
-                        capture_metadata(agent.stdout, out)
+                        capture_metadata(agent.stdout, out, probe=probe)
                     except OSError:
                         # Never quote a capture exception that may contain input.
                         return
@@ -627,6 +654,23 @@ def main() -> int:
     )
     sandbox = env["SANDBOX"]
     workspace = Path(env["GITHUB_WORKSPACE"])
+    probe = ""
+    if probe_file := os.environ.get("TEND_METADATA_PROBE_FILE", ""):
+        try:
+            path = (workspace / probe_file).resolve()
+            if (
+                not metadata_only
+                or not path.is_relative_to(workspace.resolve())
+                or not path.is_file()
+            ):
+                raise ValueError
+            with path.open("rb") as source:
+                raw = source.read(66)
+            if not re.fullmatch(rb"[0-9a-f]{64}\n?", raw):
+                raise ValueError
+            probe = raw.decode("ascii").strip()
+        except (OSError, ValueError, RuntimeError):
+            raise SystemExit("Invalid synthetic metadata probe configuration") from None
     stream_json = Path(env["RUNNER_TEMP"]) / "tend-stream.json"
     stderr_log = Path(env["RUNNER_TEMP"]) / "tend-claude-stderr.log"
 
@@ -683,6 +727,7 @@ def main() -> int:
             stream_json=stream_json,
             stderr_log=stderr_log,
             metadata_only=metadata_only,
+            probe=probe,
         )
     finally:
         # supervise() kills and reaps the sandbox uid on every exit, including

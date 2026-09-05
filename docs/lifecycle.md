@@ -72,6 +72,16 @@ or write it into repository artifacts. Native event metadata does not establish
 review correctness or protected-write authorization. Qualify with dummy context
 on the actual pinned runtime before admitting a private service.
 
+For that synthetic qualification only, set `metadata_probe_file` to a workspace
+file containing a 64-character lowercase hex canary (optional final newline).
+The supervisor reads it once before launch; missing, invalid or outside-workspace
+files refuse the launch. The same pre-persistence filter derives `probe_seen`
+booleans from native return text and final result text, ignoring supplied flags
+and launch prompts. Require correlated successful native returns and a successful
+final result with these booleans true, then verify the canary is absent from
+retained diagnostics. An absent canary alone is not positive proof of suppression.
+Never point this qualification input at real private context or credentials.
+
 The [throwaway prototype](https://github.com/Reid-Surmeier/tend/blob/510e4b71ad743b85411d277b991a3b36bfd1a8a2/generator/prototype-lifecycle-203.html)
 is archived outside production. Its six browser walkthroughs and eight targeted
 rejection checks exercise the handoff model, not live agent execution. The HTML
