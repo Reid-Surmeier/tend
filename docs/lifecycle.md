@@ -92,6 +92,30 @@ Missing lineage stays missing; malformed lineage refuses capture. This lets a
 consumer correlate observed child tool responses without asking the child to
 regenerate their bodies. Actual runtime lineage still needs qualification.
 
+For a previously observed native launch with matching session and parent,
+a single successful return may carry `native_agent: {id, status: "completed"}`.
+These fields come only from the native structured `tool_use_result`
+([Agent output contract](https://code.claude.com/docs/en/agent-sdk/typescript#sdkusermessage)),
+not decorated tool-result text, launch arguments or supplied metadata flags.
+Missing output stays missing; invalid native IDs refuse capture. The currently
+supported native ID is `a` followed by 16 lowercase hexadecimal characters.
+
+An optional `native_agent.review` is retained only when the completed child's
+structured content is one text block of at most 1024 UTF-8 bytes containing
+exactly this JSON object, with no extra or duplicate keys:
+
+```json
+{"axis":"standards","candidate":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","fixed_point":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verdict":"ship"}
+```
+
+Axes are `standards`, `spec` and `ponytail`; verdicts are `ship` or `revise`.
+Both commits must be full lowercase SHA-1 strings. Prose, malformed declarations
+and nonstandard constants provide no review. No free-form findings are retained.
+This is an observed model declaration, not write authority or proof that the
+review is correct. Adopters must validate independent trusted jobs and sessions,
+exact commits, baseline, holds and artifact provenance separately. The native
+structured-output shape still requires qualification on the pinned runtime.
+
 The [throwaway prototype](https://github.com/Reid-Surmeier/tend/blob/510e4b71ad743b85411d277b991a3b36bfd1a8a2/generator/prototype-lifecycle-203.html)
 is archived outside production. Its six browser walkthroughs and eight targeted
 rejection checks exercise the handoff model, not live agent execution. The HTML

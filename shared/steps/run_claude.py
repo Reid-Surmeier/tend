@@ -223,6 +223,45 @@ def signal_sandbox(name: str, sandbox: str) -> None:
     )
 
 
+def _review_declaration(content: Any) -> dict[str, str] | None:
+    """Keep only an exact, bounded declaration, never prose or private fields."""
+    if not isinstance(content, list) or len(content) != 1:
+        return None
+    block = content[0]
+    if (
+        not isinstance(block, dict)
+        or block.get("type") != "text"
+        or not isinstance(block.get("text"), str)
+    ):
+        return None
+    text = block["text"]
+    if len(text.encode()) > 1024:
+        return None
+    try:
+        review = json.loads(
+            text,
+            parse_constant=int,
+            object_pairs_hook=lambda pairs: (
+                dict(pairs) if len(dict(pairs)) == len(pairs) else None
+            ),
+        )
+    except (ValueError, RecursionError):
+        return None
+    if (
+        not isinstance(review, dict)
+        or set(review) != {"axis", "candidate", "fixed_point", "verdict"}
+        or not all(isinstance(value, str) for value in review.values())
+        or review["axis"] not in {"standards", "spec", "ponytail"}
+        or review["verdict"] not in {"ship", "revise"}
+        or any(
+            not re.fullmatch(r"[0-9a-f]{40}", review[key])
+            for key in ("candidate", "fixed_point")
+        )
+    ):
+        return None
+    return review
+
+
 def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> None:
     """Allowlist structural events before writing; never persist model text.
 
@@ -231,6 +270,8 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
     """
     limit = 4 * 1024 * 1024
     failed = False
+    native_launches: dict[str, tuple[str, str | None]] = {}
+    native_completions: set[str] = set()
     tool_id = re.compile(r"toolu_[A-Za-z0-9]{10,64}\Z")
     session_id = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
     try:
@@ -367,6 +408,41 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                 value = event.get("session_id")
                 if isinstance(value, str) and session_id.fullmatch(value):
                     record["session_id"] = value
+                if (
+                    kind in ("assistant", "user")
+                    and "session_id" in record
+                    and "parent_tool_use_id" in record
+                ):
+                    lineage = (record["session_id"], record["parent_tool_use_id"])
+                    if kind == "assistant":
+                        for block in kept:
+                            if block["id"] in native_launches:
+                                raise ValueError
+                            native_launches[block["id"]] = lineage
+                    elif (
+                        len(kept) == 1
+                        and native_launches.get(kept[0]["tool_use_id"]) == lineage
+                    ):
+                        if kept[0]["tool_use_id"] in native_completions:
+                            raise ValueError
+                        native = event.get("tool_use_result")
+                        if (
+                            isinstance(native, dict)
+                            and native.get("status") == "completed"
+                            and not kept[0]["is_error"]
+                        ):
+                            agent = native.get("agentId")
+                            if not isinstance(agent, str) or not re.fullmatch(
+                                r"a[0-9a-f]{16}", agent
+                            ):
+                                raise ValueError
+                            kept[0]["native_agent"] = {
+                                "id": agent,
+                                "status": "completed",
+                            }
+                            if review := _review_declaration(native.get("content")):
+                                kept[0]["native_agent"]["review"] = review
+                            native_completions.add(kept[0]["tool_use_id"])
                 encoded = json.dumps(record, allow_nan=False).encode()
                 if probe and probe.encode() in encoded:
                     raise ValueError
