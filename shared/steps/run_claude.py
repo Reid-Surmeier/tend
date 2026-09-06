@@ -223,9 +223,13 @@ def signal_sandbox(name: str, sandbox: str) -> None:
     )
 
 
-def _review_declaration(review: Any) -> dict[str, Any] | None:
-    """Keep only an exact, bounded declaration, never prose or private fields."""
-    if len(json.dumps(review, allow_nan=False).encode()) > 1024:
+def _review_declaration(
+    review: Any, *, review_source_only: bool = False
+) -> dict[str, Any] | None:
+    """Explanations are permitted only for a trusted source-only caller."""
+    if len(json.dumps(review, allow_nan=False).encode()) > (
+        12288 if review_source_only else 1024
+    ):
         return None
     if (
         not isinstance(review, dict)
@@ -250,7 +254,22 @@ def _review_declaration(review: Any) -> dict[str, Any] | None:
         or len(findings) > 8
         or any(
             not isinstance(item, dict)
-            or set(item) != {"file", "line", "kind"}
+            or set(item)
+            != (
+                {"file", "line", "kind", "explanation", "change"}
+                if review_source_only
+                else {"file", "line", "kind"}
+            )
+            or (
+                review_source_only
+                and any(
+                    not isinstance(item[key], str)
+                    or not item[key].strip()
+                    or not item[key].isprintable()
+                    or len(item[key]) > 600
+                    for key in ("explanation", "change")
+                )
+            )
             or type(item["file"]) is not int
             or not 0 <= item["file"] < 1_000_000
             or type(item["line"]) is not int
@@ -268,8 +287,14 @@ def _review_declaration(review: Any) -> dict[str, Any] | None:
     return review
 
 
-def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> None:
-    """Allowlist structural events before writing; never persist model text.
+def capture_metadata(
+    source: BinaryIO,
+    target: BinaryIO,
+    *,
+    probe: str = "",
+    review_source_only: bool = False,
+) -> None:
+    """Allowlist native events and opted-in source-only findings before writing.
 
     A malformed or oversized record makes the entire capture unsuccessful.
     # ponytail: 4 MiB per record; increase only for a measured legitimate event.
@@ -369,7 +394,10 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                                 {"type": "tool_use", "name": block["name"], "id": value}
                             )
                             if block["name"] == review_tool:
-                                review = _review_declaration(block.get("input"))
+                                review = _review_declaration(
+                                    block.get("input"),
+                                    review_source_only=review_source_only,
+                                )
                                 if review is not None:
                                     kept[-1]["review"] = review
                         elif kind == "user" and block.get("type") == "tool_result":
@@ -532,6 +560,7 @@ def supervise(
     stderr_log: Path,
     metadata_only: bool = False,
     probe: str = "",
+    review_source_only: bool = False,
 ) -> Supervised:
     """Run *argv* under the bound, capturing its streams to runner-owned files.
 
@@ -582,7 +611,12 @@ def supervise(
 
                 def collect() -> None:
                     try:
-                        capture_metadata(agent.stdout, out, probe=probe)
+                        capture_metadata(
+                            agent.stdout,
+                            out,
+                            probe=probe,
+                            review_source_only=review_source_only,
+                        )
                     except OSError:
                         # Never quote a capture exception that may contain input.
                         return
@@ -797,6 +831,11 @@ def main() -> int:
     if mode not in ("true", "false"):
         raise SystemExit("TEND_METADATA_ONLY must be true or false")
     metadata_only = mode == "true"
+    review_mode = os.environ.get("TEND_REVIEW_SOURCE_ONLY", "false")
+    if review_mode not in ("true", "false") or (
+        review_mode == "true" and not metadata_only
+    ):
+        raise SystemExit("Invalid source-only review configuration")
     env = _common.require_env(
         "SANDBOX",
         "AGENT_ENV_FILE",
@@ -889,6 +928,7 @@ def main() -> int:
             stderr_log=stderr_log,
             metadata_only=metadata_only,
             probe=probe,
+            review_source_only=review_mode == "true",
         )
     finally:
         # supervise() kills and reaps the sandbox uid on every exit, including

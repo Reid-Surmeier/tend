@@ -102,7 +102,7 @@ supported native ID is `a` followed by 16 lowercase hexadecimal characters.
 
 The adopter supplies a local MCP tool named `mcp__tend_review__submit_review`.
 Its input schema accepts this object; the child submits it through the native
-tool interface, not as formatted final text. The encoded declaration is at most
+tool interface, not as formatted final text. By default the encoded declaration is at most
 1024 UTF-8 bytes, with no extra or duplicate keys:
 
 ```json
@@ -117,7 +117,17 @@ Up to eight distinct findings may contain only numeric `file` and `line` plus
 index below 1000000 into the adopter's trusted sorted changed-file list for the
 exact diff. `line` is 0 through 10000000; zero means file-level. The adopter must
 resolve and validate these indices against that immutable diff before using them
-to investigate. Boolean numbers, unknown fields and free-form text are refused.
+to investigate. Boolean numbers, unknown fields and, by default, free-form text are refused.
+
+For source-only code reviewers, explicitly set `review_source_only: "true"` with
+`metadata_only: "true"` and `memory_gist: "false"`. The trusted adopter must
+exclude private memory services and copied home configuration from that job;
+the filter cannot establish this isolation. Each finding then also requires
+`explanation` and `change`: nonempty, printable single-line strings, at most 600
+characters each. The declaration limit becomes 12288 encoded bytes. Supply the
+verified problem and concrete repair. All other schema and provenance rules
+remain unchanged; raw prompts, ordinary model text and tool outputs are still
+suppressed. The coordinator can retain its separate private-memory capability.
 
 The filter observes the named tool's native launch and successful return in the
 same known direct-child lineage. Its launch retains only tool identity and the
@@ -134,8 +144,8 @@ tool, prompt and guard together; the guard must independently correlate the
 submission events with the completed child. The tool has no delivery authority,
 external write or memory access, and validates the adopter's exact target.
 
-No free-form findings, paths, rule quotes or private context are retained, and
-the harness performs no retry. This is an observed model declaration, not proof
+Default metadata capture retains no free-form findings, paths, rule quotes or
+private context. The harness performs no retry. This is an observed model declaration, not proof
 that the review is correct. Adopters still validate independent trusted jobs and
 sessions, exact commits, baseline, holds and artifact provenance. Actual native
 tool output requires qualification on the pinned runtime.

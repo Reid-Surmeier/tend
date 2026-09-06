@@ -65,6 +65,13 @@ inputs:
       Qualification only: workspace file containing a synthetic 64-character
       lowercase hex canary. Requires metadata_only. Capture records only whether
       return/final text contained it; never use real private data or credentials.
+  review_source_only:
+    default: "false"
+    description: >-
+      Retain bounded explanation and change fields in typed review findings.
+      Requires metadata_only and disabled memory_gist. The trusted caller must
+      supply repository/review inputs only: no private memory service or copied
+      home configuration. Raw transcripts and tool results remain suppressed.
   claude_version:
     default: "2.1.251"
     description: >-
@@ -163,12 +170,18 @@ runs:
         BASH_ENV: ""
         TEND_METADATA_ONLY: ${{ inputs.metadata_only }}
         TEND_MEMORY_GIST: ${{ inputs.memory_gist }}
+        TEND_REVIEW_SOURCE_ONLY: ${{ inputs.review_source_only }}
         TEND_METADATA_PROBE_FILE: ${{ inputs.metadata_probe_file }}
       run: |
         case "$TEND_METADATA_ONLY" in
           false) ;;
           true) test "$TEND_MEMORY_GIST" = false || { echo 'metadata_only cannot use memory_gist' >&2; exit 1; } ;;
           *) echo 'metadata_only must be true or false' >&2; exit 1 ;;
+        esac
+        case "$TEND_REVIEW_SOURCE_ONLY" in
+          false) ;;
+          true) test "$TEND_METADATA_ONLY" = true || { echo 'source-only review requires metadata_only' >&2; exit 1; } ;;
+          *) echo 'review_source_only must be true or false' >&2; exit 1 ;;
         esac
         if test -n "$TEND_METADATA_PROBE_FILE"; then
           test "$TEND_METADATA_ONLY" = true || { echo 'metadata probe requires metadata_only' >&2; exit 1; }
@@ -420,6 +433,7 @@ runs:
         TEND_PROMPT: ${{ inputs.prompt }}
         TEND_TIMEOUT_SEC: ${{ inputs.timeout_seconds }}
         SHOW_FULL_OUTPUT: ${{ inputs.show_full_output }}
+        TEND_REVIEW_SOURCE_ONLY: ${{ inputs.review_source_only }}
         TEND_METADATA_ONLY: ${{ inputs.metadata_only }}
         TEND_METADATA_PROBE_FILE: ${{ inputs.metadata_probe_file }}
       run: /usr/bin/python3 -E -s "${{ github.action_path }}/../shared/steps/run_claude.py"

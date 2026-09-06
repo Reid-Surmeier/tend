@@ -149,8 +149,10 @@ Verdict = Callable[..., tuple[int, str, str]]
         "final-only",
     ],
 )
+@pytest.mark.parametrize("source_only", [False, True])
 def test_metadata_binds_one_successful_submission_to_the_completed_child(
     case: str,
+    source_only: bool,
 ) -> None:
     agent_call = "toolu_agent0123456789abcdef"
     submit_call = "toolu_submit0123456789abcdef"
@@ -167,6 +169,19 @@ def test_metadata_binds_one_successful_submission_to_the_completed_child(
         "complete": True,
         "findings": [],
     }
+    if source_only:
+        review.update(
+            verdict="revise",
+            findings=[
+                {
+                    "file": 0,
+                    "line": 1,
+                    "kind": "correctness",
+                    "explanation": "The empty list reaches index zero.",
+                    "change": "Reject an empty list before indexing.",
+                }
+            ],
+        )
     launch = {
         **common,
         "type": "assistant",
@@ -287,7 +302,9 @@ def test_metadata_binds_one_successful_submission_to_the_completed_child(
     events.append({**common, "type": "result", "subtype": "success", "is_error": False})
     output = io.BytesIO()
     run_claude.capture_metadata(
-        io.BytesIO("\n".join(map(json.dumps, events)).encode()), output
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()),
+        output,
+        review_source_only=source_only,
     )
     records = list(map(json.loads, output.getvalue().splitlines()))
     reviews = [
@@ -302,6 +319,43 @@ def test_metadata_binds_one_successful_submission_to_the_completed_child(
     else:
         assert run_claude.turn_outcome(records) is not None or not reviews
     assert b"PRIVATE" not in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("explanation", ""),
+        ("change", " "),
+        ("change", 1),
+        ("explanation", "x" * 601),
+        ("change", "x" * 601),
+        ("extra", "not allowed"),
+        ("change", "line\nbreak"),
+    ],
+)
+def test_source_only_findings_require_bounded_actionable_text(
+    field: str, value: Any
+) -> None:
+    review = {
+        "axis": "spec",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": "revise",
+        "complete": True,
+        "findings": [
+            {
+                "file": 0,
+                "line": 1,
+                "kind": "correctness",
+                "explanation": "Indexing an empty list raises.",
+                "change": "Reject empty lists before indexing.",
+            }
+        ],
+    }
+    assert run_claude._review_declaration(review) is None
+    assert run_claude._review_declaration(review, review_source_only=True) == review
+    review["findings"][0][field] = value
+    assert run_claude._review_declaration(review, review_source_only=True) is None
 
 
 @pytest.mark.parametrize(
@@ -1420,6 +1474,73 @@ def test_metadata_timeout_is_not_success_and_keeps_no_text(launch: Launcher) -> 
         "PRIVATE_CONTEXT_CANARY"
         not in result.out + result.summary + result.stream_json.read_text()
     )
+
+
+@pytest.mark.parametrize(
+    "mode,metadata", [("true", "false"), ("TRUE", "true"), ("", "true")]
+)
+def test_source_only_configuration_refuses_before_launch(
+    mode: str, metadata: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEND_REVIEW_SOURCE_ONLY", mode)
+    monkeypatch.setenv("TEND_METADATA_ONLY", metadata)
+    with pytest.raises(SystemExit, match="^Invalid source-only review configuration$"):
+        run_claude.main()
+
+
+def test_source_only_flag_reaches_the_supervisor(launch: Launcher) -> None:
+    common = {
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "parent_tool_use_id": None,
+    }
+    agent = "toolu_agent0123456789abcdef"
+    declaration = {
+        "axis": "spec",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": "revise",
+        "complete": True,
+        "findings": [
+            {
+                "file": 0,
+                "line": 1,
+                "kind": "correctness",
+                "explanation": "An empty list raises.",
+                "change": "Reject empty lists.",
+            }
+        ],
+    }
+    events = [
+        {
+            **common,
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "tool_use", "name": "Agent", "id": agent}]
+            },
+        },
+        {
+            **common,
+            "parent_tool_use_id": agent,
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "mcp__tend_review__submit_review",
+                        "id": "toolu_submit0123456789abcdef",
+                        "input": declaration,
+                    }
+                ]
+            },
+        },
+    ]
+    result = launch(
+        stream="\n".join(map(json.dumps, events)) + "\n" + _ev_result(),
+        TEND_METADATA_ONLY="true",
+        TEND_REVIEW_SOURCE_ONLY="true",
+    )
+    assert "Reject empty lists." in result.stream_json.read_text()
+    assert "Reject empty lists." not in result.out + result.summary
 
 
 def test_metadata_probe_file_reaches_the_supervisor(
