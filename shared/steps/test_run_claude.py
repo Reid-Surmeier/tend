@@ -65,6 +65,8 @@ def test_metadata_observes_completed_native_identity_not_decorated_text(
         "candidate": "a" * 40,
         "fixed_point": "b" * 40,
         "verdict": verdict,
+        "complete": verdict != "revise",
+        "findings": [],
     }
     events = [
         {
@@ -107,11 +109,167 @@ def test_metadata_observes_completed_native_identity_not_decorated_text(
     if verdict:
         expected["review"] = review
     assert records[1]["message"]["content"][0]["native_agent"] == expected
+    assert records[1]["message"]["content"][0]["review_parse"] == (
+        "accepted" if verdict else "json"
+    )
     assert b"PRIVATE" not in output.getvalue()
     assert run_claude.turn_outcome(records) is None
 
 
 Verdict = Callable[..., tuple[int, str, str]]
+
+
+@pytest.mark.parametrize(
+    "case,status",
+    [
+        ("finding", "accepted"),
+        ("incomplete", "accepted"),
+        ("eight", "accepted"),
+        ("missing", "content-shape"),
+        ("multiple", "content-shape"),
+        ("block-type", "content-shape"),
+        ("oversized", "oversized"),
+        ("json", "json"),
+        ("nan", "json"),
+        ("forged-status", "json"),
+        ("old-schema", "schema"),
+        ("duplicate-key", "schema"),
+        ("newline-sha", "schema"),
+        ("complete-number", "schema"),
+        ("findings-type", "schema"),
+        ("ship-finding", "schema"),
+        ("revise-empty", "schema"),
+        ("nine", "schema"),
+        ("duplicate-finding", "schema"),
+        ("file-bool", "schema"),
+        ("file-negative", "schema"),
+        ("file-high", "schema"),
+        ("line-bool", "schema"),
+        ("line-negative", "schema"),
+        ("line-high", "schema"),
+        ("kind-text", "schema"),
+        ("extra-text", "schema"),
+        ("item-string", "schema"),
+        ("no-kind", "schema"),
+    ],
+)
+def test_metadata_review_diagnostics_and_numeric_findings(
+    case: str, status: str
+) -> None:
+    review = {
+        "axis": "standards",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": "revise",
+        "complete": True,
+        "findings": [{"file": 0, "line": 1, "kind": "security"}],
+    }
+    if case == "incomplete":
+        review.update(complete=False, findings=[])
+    elif case in ("eight", "nine"):
+        review["findings"] = [
+            {"file": n, "line": 0, "kind": "correctness"}
+            for n in range(8 if case == "eight" else 9)
+        ]
+    elif case == "old-schema":
+        del review["complete"], review["findings"]
+    elif case == "newline-sha":
+        review["candidate"] += "\n"
+    elif case == "complete-number":
+        review["complete"] = 1
+    elif case == "findings-type":
+        review["findings"] = "PRIVATE findings"
+    elif case == "ship-finding":
+        review["verdict"] = "ship"
+    elif case == "revise-empty":
+        review["findings"] = []
+    elif case == "duplicate-finding":
+        review["findings"] *= 2
+    elif case in (
+        "file-bool",
+        "file-negative",
+        "file-high",
+        "line-bool",
+        "line-negative",
+        "line-high",
+    ):
+        field, variant = case.split("-")
+        review["findings"][0][field] = (
+            True
+            if variant == "bool"
+            else -1
+            if variant == "negative"
+            else (1000000 if field == "file" else 10000001)
+        )
+    elif case == "kind-text":
+        review["findings"][0]["kind"] = "PRIVATE reason"
+    elif case == "extra-text":
+        review["findings"][0]["message"] = "PRIVATE finding"
+    elif case == "item-string":
+        review["findings"] = ["PRIVATE finding"]
+    elif case == "no-kind":
+        del review["findings"][0]["kind"]
+    text = json.dumps(review)
+    if case in ("json", "forged-status"):
+        text = "PRIVATE non-JSON response"
+    elif case == "nan":
+        text = text.replace('"complete": true', '"complete": NaN')
+    elif case == "duplicate-key":
+        text = text.replace('"line": 1', '"line": 9, "line": 1')
+    elif case == "oversized":
+        text += " " * 1024
+    content = [{"type": "text", "text": text}]
+    if case == "missing":
+        content = None
+    elif case == "multiple":
+        content *= 2
+    elif case == "block-type":
+        content[0]["type"] = "image"
+    tool = "toolu_0123456789abcdefghijklm"
+    common = {
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "parent_tool_use_id": None,
+    }
+    events = [
+        {
+            **common,
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Agent", "id": tool}]},
+        },
+        {
+            **common,
+            "type": "user",
+            "review_parse": "accepted",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool,
+                        "content": "PRIVATE decorated text",
+                        "review_parse": "accepted",
+                    }
+                ]
+            },
+            "tool_use_result": {
+                "status": "completed",
+                "agentId": "a0123456789abcdef",
+                "content": content,
+            },
+        },
+        {**common, "type": "result", "subtype": "success", "is_error": False},
+    ]
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()), output
+    )
+    records = list(map(json.loads, output.getvalue().splitlines()))
+    result = records[1]["message"]["content"][0]
+    assert result["review_parse"] == status
+    assert ("review" in result["native_agent"]) == (status == "accepted")
+    if status == "accepted":
+        assert result["native_agent"]["review"] == review
+    assert b"PRIVATE" not in output.getvalue()
+    assert run_claude.turn_outcome(records) is None
 
 
 @pytest.mark.parametrize(
@@ -153,6 +311,8 @@ def test_metadata_refuses_unobserved_or_malformed_native_review(case: str) -> No
         "candidate": "a" * 40,
         "fixed_point": "b" * 40,
         "verdict": "ship",
+        "complete": True,
+        "findings": [],
     }
     launch = {
         **common,

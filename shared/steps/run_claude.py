@@ -223,20 +223,20 @@ def signal_sandbox(name: str, sandbox: str) -> None:
     )
 
 
-def _review_declaration(content: Any) -> dict[str, str] | None:
+def _review_declaration(content: Any) -> tuple[dict[str, Any] | None, str]:
     """Keep only an exact, bounded declaration, never prose or private fields."""
     if not isinstance(content, list) or len(content) != 1:
-        return None
+        return None, "content-shape"
     block = content[0]
     if (
         not isinstance(block, dict)
         or block.get("type") != "text"
         or not isinstance(block.get("text"), str)
     ):
-        return None
+        return None, "content-shape"
     text = block["text"]
     if len(text.encode()) > 1024:
-        return None
+        return None, "oversized"
     try:
         review = json.loads(
             text,
@@ -246,11 +246,15 @@ def _review_declaration(content: Any) -> dict[str, str] | None:
             ),
         )
     except (ValueError, RecursionError):
-        return None
+        return None, "json"
     if (
         not isinstance(review, dict)
-        or set(review) != {"axis", "candidate", "fixed_point", "verdict"}
-        or not all(isinstance(value, str) for value in review.values())
+        or set(review)
+        != {"axis", "candidate", "fixed_point", "verdict", "complete", "findings"}
+        or not all(
+            isinstance(review[key], str)
+            for key in ("axis", "candidate", "fixed_point", "verdict")
+        )
         or review["axis"] not in {"standards", "spec", "ponytail"}
         or review["verdict"] not in {"ship", "revise"}
         or any(
@@ -258,8 +262,30 @@ def _review_declaration(content: Any) -> dict[str, str] | None:
             for key in ("candidate", "fixed_point")
         )
     ):
-        return None
-    return review
+        return None, "schema"
+    findings = review["findings"]
+    if (
+        type(review["complete"]) is not bool
+        or not isinstance(findings, list)
+        or len(findings) > 8
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"file", "line", "kind"}
+            or type(item["file"]) is not int
+            or not 0 <= item["file"] < 1_000_000
+            or type(item["line"]) is not int
+            or not 0 <= item["line"] <= 10_000_000
+            or not isinstance(item["kind"], str)
+            or item["kind"] not in {"correctness", "security", "spec", "simplification"}
+            for item in findings
+        )
+    ):
+        return None, "schema"
+    if len({(item["file"], item["line"], item["kind"]) for item in findings}) != len(
+        findings
+    ) or (review["verdict"] == "ship") != (review["complete"] and not findings):
+        return None, "schema"
+    return review, "accepted"
 
 
 def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> None:
@@ -440,7 +466,9 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                                 "id": agent,
                                 "status": "completed",
                             }
-                            if review := _review_declaration(native.get("content")):
+                            review, status = _review_declaration(native.get("content"))
+                            kept[0]["review_parse"] = status
+                            if review is not None:
                                 kept[0]["native_agent"]["review"] = review
                             native_completions.add(kept[0]["tool_use_id"])
                 encoded = json.dumps(record, allow_nan=False).encode()

@@ -105,12 +105,26 @@ structured content is one text block of at most 1024 UTF-8 bytes containing
 exactly this JSON object, with no extra or duplicate keys:
 
 ```json
-{"axis":"standards","candidate":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","fixed_point":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verdict":"ship"}
+{"axis":"standards","candidate":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","fixed_point":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verdict":"ship","complete":true,"findings":[]}
 ```
 
 Axes are `standards`, `spec` and `ponytail`; verdicts are `ship` or `revise`.
-Both commits must be full lowercase SHA-1 strings. Prose, malformed declarations
-and nonstandard constants provide no review. No free-form findings are retained.
+Both commits must be full lowercase SHA-1 strings. `ship` requires `complete:true`
+and no findings. `revise` requires incomplete review or at least one finding.
+Up to eight distinct findings may contain only numeric `file` and `line` plus
+`kind`: `correctness`, `security`, `spec` or `simplification`. `file` is a zero-based
+index below 1000000 into the adopter's trusted sorted changed-file list for the
+exact diff. `line` is 0 through 10000000; zero means file-level. The adopter must
+resolve and validate these indices against that immutable diff before using them
+to investigate. Boolean numbers, unknown fields and free-form text are refused.
+
+For correlated successful native completions, sibling tool-result field
+`review_parse` is derived by the filter: `accepted`, `content-shape`, `oversized`,
+`json` or `schema`. It explains an omitted declaration without retaining its text;
+supplied flags cannot set it. Prose, malformed declarations and nonstandard
+constants provide no review. The old four-field format now produces `schema`;
+update an adopter's pinned prompt and guard together. No free-form findings,
+paths, rule quotes or private context are retained, and no retry is performed.
 This is an observed model declaration, not write authority or proof that the
 review is correct. Adopters must validate independent trusted jobs and sessions,
 exact commits, baseline, holds and artifact provenance separately. The native
