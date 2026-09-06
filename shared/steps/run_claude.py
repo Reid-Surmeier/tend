@@ -223,30 +223,10 @@ def signal_sandbox(name: str, sandbox: str) -> None:
     )
 
 
-def _review_declaration(content: Any) -> tuple[dict[str, Any] | None, str]:
+def _review_declaration(review: Any) -> dict[str, Any] | None:
     """Keep only an exact, bounded declaration, never prose or private fields."""
-    if not isinstance(content, list) or len(content) != 1:
-        return None, "content-shape"
-    block = content[0]
-    if (
-        not isinstance(block, dict)
-        or block.get("type") != "text"
-        or not isinstance(block.get("text"), str)
-    ):
-        return None, "content-shape"
-    text = block["text"]
-    if len(text.encode()) > 1024:
-        return None, "oversized"
-    try:
-        review = json.loads(
-            text,
-            parse_constant=int,
-            object_pairs_hook=lambda pairs: (
-                dict(pairs) if len(dict(pairs)) == len(pairs) else None
-            ),
-        )
-    except (ValueError, RecursionError):
-        return None, "json"
+    if len(json.dumps(review, allow_nan=False).encode()) > 1024:
+        return None
     if (
         not isinstance(review, dict)
         or set(review)
@@ -262,7 +242,7 @@ def _review_declaration(content: Any) -> tuple[dict[str, Any] | None, str]:
             for key in ("candidate", "fixed_point")
         )
     ):
-        return None, "schema"
+        return None
     findings = review["findings"]
     if (
         type(review["complete"]) is not bool
@@ -280,12 +260,12 @@ def _review_declaration(content: Any) -> tuple[dict[str, Any] | None, str]:
             for item in findings
         )
     ):
-        return None, "schema"
+        return None
     if len({(item["file"], item["line"], item["kind"]) for item in findings}) != len(
         findings
     ) or (review["verdict"] == "ship") != (review["complete"] and not findings):
-        return None, "schema"
-    return review, "accepted"
+        return None
+    return review
 
 
 def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> None:
@@ -298,6 +278,12 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
     failed = False
     native_launches: dict[str, tuple[str, str | None]] = {}
     native_completions: set[str] = set()
+    submission_launches: dict[
+        str, tuple[tuple[str, str | None], dict[str, Any] | None]
+    ] = {}
+    returned_tools: set[str] = set()
+    submitted_reviews: dict[str, dict[str, Any] | None] = {}
+    review_tool = "mcp__tend_review__submit_review"
     tool_id = re.compile(r"toolu_[A-Za-z0-9]{10,64}\Z")
     session_id = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
     try:
@@ -308,7 +294,12 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                     line = source.readline(limit + 1)
                 continue
             try:
-                event = json.loads(line)
+                event = json.loads(
+                    line,
+                    object_pairs_hook=lambda pairs: (
+                        dict(pairs) if len(dict(pairs)) == len(pairs) else None
+                    ),
+                )
                 if not isinstance(event, dict):
                     raise TypeError
                 kind = event.get("type")
@@ -367,7 +358,7 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                         if (
                             kind == "assistant"
                             and block.get("type") == "tool_use"
-                            and block.get("name") in ("Agent", "Task")
+                            and block.get("name") in ("Agent", "Task", review_tool)
                         ):
                             value = block.get("id")
                             if not isinstance(value, str) or not tool_id.fullmatch(
@@ -377,6 +368,10 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                             kept.append(
                                 {"type": "tool_use", "name": block["name"], "id": value}
                             )
+                            if block["name"] == review_tool:
+                                review = _review_declaration(block.get("input"))
+                                if review is not None:
+                                    kept[-1]["review"] = review
                         elif kind == "user" and block.get("type") == "tool_result":
                             value = block.get("tool_use_id")
                             if (
@@ -434,17 +429,59 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                 value = event.get("session_id")
                 if isinstance(value, str) and session_id.fullmatch(value):
                     record["session_id"] = value
+                has_lineage = "session_id" in record and "parent_tool_use_id" in record
                 if (
-                    kind in ("assistant", "user")
-                    and "session_id" in record
-                    and "parent_tool_use_id" in record
+                    kind == "assistant"
+                    and not has_lineage
+                    and any(block["name"] == review_tool for block in kept)
                 ):
+                    raise ValueError
+                if kind == "user":
+                    for block in kept:
+                        returned = block["tool_use_id"]
+                        if returned in submission_launches and (
+                            not has_lineage
+                            or len(kept) != 1
+                            or returned in returned_tools
+                        ):
+                            raise ValueError
+                        returned_tools.add(returned)
+                if kind in ("assistant", "user") and has_lineage:
                     lineage = (record["session_id"], record["parent_tool_use_id"])
                     if kind == "assistant":
                         for block in kept:
-                            if block["id"] in native_launches:
+                            if (
+                                block["id"] in native_launches
+                                or block["id"] in submission_launches
+                            ):
                                 raise ValueError
-                            native_launches[block["id"]] = lineage
+                            if block["name"] == review_tool:
+                                if (
+                                    block["id"] in returned_tools
+                                    or native_launches.get(lineage[1])
+                                    != (lineage[0], None)
+                                    or lineage[1] in native_completions
+                                ):
+                                    raise ValueError
+                                submission_launches[block["id"]] = (
+                                    lineage,
+                                    block.get("review"),
+                                )
+                            else:
+                                native_launches[block["id"]] = lineage
+                    elif (
+                        len(kept) == 1 and kept[0]["tool_use_id"] in submission_launches
+                    ):
+                        submission = kept[0]["tool_use_id"]
+                        expected, review = submission_launches[submission]
+                        if lineage != expected or lineage[1] in native_completions:
+                            raise ValueError
+                        if not kept[0]["is_error"]:
+                            if lineage[1] in submitted_reviews:
+                                raise ValueError
+                            submitted_reviews[lineage[1]] = review
+                            if review is not None:
+                                kept[0]["review_submission"] = review
                     elif (
                         len(kept) == 1
                         and native_launches.get(kept[0]["tool_use_id"]) == lineage
@@ -466,8 +503,12 @@ def capture_metadata(source: BinaryIO, target: BinaryIO, *, probe: str = "") -> 
                                 "id": agent,
                                 "status": "completed",
                             }
-                            review, status = _review_declaration(native.get("content"))
-                            kept[0]["review_parse"] = status
+                            review = submitted_reviews.get(kept[0]["tool_use_id"])
+                            kept[0]["review_parse"] = (
+                                "accepted"
+                                if review is not None
+                                else "missing-submission"
+                            )
                             if review is not None:
                                 kept[0]["native_agent"]["review"] = review
                             native_completions.add(kept[0]["tool_use_id"])

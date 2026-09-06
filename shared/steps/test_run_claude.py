@@ -106,17 +106,202 @@ def test_metadata_observes_completed_native_identity_not_decorated_text(
     )
     records = list(map(json.loads, output.getvalue().splitlines()))
     expected = {"id": "a0123456789abcdef", "status": "completed"}
-    if verdict:
-        expected["review"] = review
     assert records[1]["message"]["content"][0]["native_agent"] == expected
-    assert records[1]["message"]["content"][0]["review_parse"] == (
-        "accepted" if verdict else "json"
-    )
+    assert records[1]["message"]["content"][0]["review_parse"] == "missing-submission"
     assert b"PRIVATE" not in output.getvalue()
     assert run_claude.turn_outcome(records) is None
 
 
 Verdict = Callable[..., tuple[int, str, str]]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "ship",
+        "failed-then-success",
+        "root",
+        "unknown-parent",
+        "nested",
+        "wrong-session",
+        "return-session",
+        "return-parent",
+        "missing-session",
+        "missing-parent",
+        "wrong-tool",
+        "missing-return",
+        "failed-return",
+        "duplicate-return",
+        "duplicate-submission",
+        "duplicate-launch",
+        "unknown-return",
+        "mixed-return",
+        "mixed-return-replay",
+        "missing-parent-return-replay",
+        "missing-session-return-replay",
+        "missing-session-launch-replay",
+        "return-before-launch",
+        "invalid-success-then-success",
+        "late-submission",
+        "unfinished",
+        "failed-native",
+        "forged-result",
+        "final-only",
+    ],
+)
+def test_metadata_binds_one_successful_submission_to_the_completed_child(
+    case: str,
+) -> None:
+    agent_call = "toolu_agent0123456789abcdef"
+    submit_call = "toolu_submit0123456789abcdef"
+    common = {
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "parent_tool_use_id": None,
+    }
+    child = {**common, "parent_tool_use_id": agent_call}
+    review = {
+        "axis": "spec",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": "ship",
+        "complete": True,
+        "findings": [],
+    }
+    launch = {
+        **common,
+        "type": "assistant",
+        "message": {
+            "content": [{"type": "tool_use", "name": "Agent", "id": agent_call}]
+        },
+    }
+    submit = {
+        **child,
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "mcp__tend_review__submit_review",
+                    "id": submit_call,
+                    "input": review,
+                }
+            ]
+        },
+    }
+    returned = {
+        **child,
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": submit_call,
+                    "is_error": False,
+                    "content": "PRIVATE response",
+                }
+            ]
+        },
+    }
+    completed = {
+        **common,
+        "type": "user",
+        "message": {
+            "content": [
+                {"type": "tool_result", "tool_use_id": agent_call, "is_error": False}
+            ]
+        },
+        "tool_use_result": {
+            "agentId": "a0123456789abcdef",
+            "status": "completed",
+            "content": [{"type": "text", "text": "PRIVATE narrative" * 1024}],
+        },
+    }
+    events = [launch, submit, returned, completed]
+    if case in ("root", "unknown-parent"):
+        submit["parent_tool_use_id"] = returned["parent_tool_use_id"] = (
+            None if case == "root" else "toolu_unknown0123456789abcdef"
+        )
+    elif case == "nested":
+        launch["parent_tool_use_id"] = "toolu_outer0123456789abcdef"
+    elif case in ("wrong-session", "return-session"):
+        (submit if case == "wrong-session" else returned)["session_id"] = (
+            "00000000-0000-4000-8000-000000000002"
+        )
+    elif case == "return-parent":
+        returned["parent_tool_use_id"] = None
+    elif case in ("missing-session", "missing-parent"):
+        del submit["session_id" if case == "missing-session" else "parent_tool_use_id"]
+    elif case == "wrong-tool":
+        submit["message"]["content"][0]["name"] = "Bash"
+    elif case == "missing-return":
+        events.remove(returned)
+    elif case == "failed-return":
+        returned["message"]["content"][0]["is_error"] = True
+    elif case == "duplicate-return":
+        events.insert(3, returned)
+    elif case in (
+        "duplicate-submission",
+        "failed-then-success",
+        "invalid-success-then-success",
+    ):
+        another = json.loads(
+            json.dumps([submit, returned]).replace(
+                submit_call, "toolu_second0123456789abcdef"
+            )
+        )
+        events[3:3] = another
+        if case == "failed-then-success":
+            returned["message"]["content"][0]["is_error"] = True
+        elif case == "invalid-success-then-success":
+            submit["message"]["content"][0]["input"] = {"private": "PRIVATE"}
+    elif case == "duplicate-launch":
+        events.insert(2, submit)
+    elif case == "unknown-return":
+        returned["message"]["content"][0]["tool_use_id"] = (
+            "toolu_unknown0123456789abcdef"
+        )
+    elif case in ("mixed-return", "mixed-return-replay"):
+        if case == "mixed-return-replay":
+            events.insert(3, json.loads(json.dumps(returned)))
+        returned["message"]["content"].append(dict(returned["message"]["content"][0]))
+    elif case in ("missing-parent-return-replay", "missing-session-return-replay"):
+        events.insert(3, json.loads(json.dumps(returned)))
+        del returned["parent_tool_use_id" if "parent" in case else "session_id"]
+    elif case == "missing-session-launch-replay":
+        events.insert(2, json.loads(json.dumps(submit)))
+        del submit["session_id"]
+    elif case == "return-before-launch":
+        events.insert(1, returned)
+    elif case == "late-submission":
+        events = [launch, completed, submit, returned]
+    elif case == "unfinished":
+        completed["tool_use_result"]["status"] = "async_launched"
+    elif case == "failed-native":
+        completed["message"]["content"][0]["is_error"] = True
+    elif case == "forged-result":
+        events.remove(submit)
+        returned["message"]["content"][0]["review_submission"] = review
+    elif case == "final-only":
+        events = [launch, completed]
+        completed["tool_use_result"]["content"][0]["text"] = json.dumps(review)
+    events.append({**common, "type": "result", "subtype": "success", "is_error": False})
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()), output
+    )
+    records = list(map(json.loads, output.getvalue().splitlines()))
+    reviews = [
+        block["native_agent"]["review"]
+        for record in records
+        for block in record.get("message", {}).get("content", [])
+        if "review" in block.get("native_agent", {})
+    ]
+    if case in ("ship", "failed-then-success"):
+        assert run_claude.turn_outcome(records) is None
+        assert reviews == [review]
+    else:
+        assert run_claude.turn_outcome(records) is not None or not reviews
+    assert b"PRIVATE" not in output.getvalue()
 
 
 @pytest.mark.parametrize(
@@ -258,13 +443,54 @@ def test_metadata_review_diagnostics_and_numeric_findings(
         },
         {**common, "type": "result", "subtype": "success", "is_error": False},
     ]
+    submission = "toolu_submit0123456789abcdef"
+    arguments = review if status in ("accepted", "schema") else {"private": text}
+    child = {**common, "parent_tool_use_id": tool}
+    events[1:1] = [
+        {
+            **child,
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "mcp__tend_review__submit_review",
+                        "id": submission,
+                        "input": arguments,
+                    }
+                ]
+            },
+        },
+        {
+            **child,
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": submission,
+                        "is_error": False,
+                        "content": "PRIVATE tool response",
+                    }
+                ]
+            },
+        },
+    ]
+    stream = "\n".join(map(json.dumps, events))
+    if case == "duplicate-key":
+        stream = stream.replace('"line": 1', '"line": 9, "line": 1')
     output = io.BytesIO()
-    run_claude.capture_metadata(
-        io.BytesIO("\n".join(map(json.dumps, events)).encode()), output
-    )
+    run_claude.capture_metadata(io.BytesIO(stream.encode()), output)
     records = list(map(json.loads, output.getvalue().splitlines()))
-    result = records[1]["message"]["content"][0]
-    assert result["review_parse"] == status
+    result = next(
+        block
+        for record in records
+        for block in record.get("message", {}).get("content", [])
+        if "native_agent" in block
+    )
+    assert result["review_parse"] == (
+        "accepted" if status == "accepted" else "missing-submission"
+    )
     assert ("review" in result["native_agent"]) == (status == "accepted")
     if status == "accepted":
         assert result["native_agent"]["review"] == review

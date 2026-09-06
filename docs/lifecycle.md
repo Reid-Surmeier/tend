@@ -100,9 +100,10 @@ not decorated tool-result text, launch arguments or supplied metadata flags.
 Missing output stays missing; invalid native IDs refuse capture. The currently
 supported native ID is `a` followed by 16 lowercase hexadecimal characters.
 
-An optional `native_agent.review` is retained only when the completed child's
-structured content is one text block of at most 1024 UTF-8 bytes containing
-exactly this JSON object, with no extra or duplicate keys:
+The adopter supplies a local MCP tool named `mcp__tend_review__submit_review`.
+Its input schema accepts this object; the child submits it through the native
+tool interface, not as formatted final text. The encoded declaration is at most
+1024 UTF-8 bytes, with no extra or duplicate keys:
 
 ```json
 {"axis":"standards","candidate":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","fixed_point":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verdict":"ship","complete":true,"findings":[]}
@@ -118,17 +119,26 @@ exact diff. `line` is 0 through 10000000; zero means file-level. The adopter mus
 resolve and validate these indices against that immutable diff before using them
 to investigate. Boolean numbers, unknown fields and free-form text are refused.
 
-For correlated successful native completions, sibling tool-result field
-`review_parse` is derived by the filter: `accepted`, `content-shape`, `oversized`,
-`json` or `schema`. It explains an omitted declaration without retaining its text;
-supplied flags cannot set it. Prose, malformed declarations and nonstandard
-constants provide no review. The old four-field format now produces `schema`;
-update an adopter's pinned prompt and guard together. No free-form findings,
-paths, rule quotes or private context are retained, and no retry is performed.
-This is an observed model declaration, not write authority or proof that the
-review is correct. Adopters must validate independent trusted jobs and sessions,
-exact commits, baseline, holds and artifact provenance separately. The native
-structured-output shape still requires qualification on the pinned runtime.
+The filter observes the named tool's native launch and successful return in the
+same known direct-child lineage. Its launch retains only tool identity and the
+validated object under `review`; its successful return retains `review_submission`.
+Only after the containing Agent/Task actually completes can that submission
+become `native_agent.review`. Root claims, unknown parents, mismatched sessions,
+failed calls and unfinished agents do not supply reviews. Duplicate calls/returns
+or a second successful submission for the same child fail the capture.
+
+On native completion, derived `review_parse` is `accepted` or
+`missing-submission`. Supplied flags and final child text cannot set it.
+There is no fallback to final-text JSON, even when well-formed. Pin the adopter's
+tool, prompt and guard together; the guard must independently correlate the
+submission events with the completed child. The tool has no delivery authority,
+external write or memory access, and validates the adopter's exact target.
+
+No free-form findings, paths, rule quotes or private context are retained, and
+the harness performs no retry. This is an observed model declaration, not proof
+that the review is correct. Adopters still validate independent trusted jobs and
+sessions, exact commits, baseline, holds and artifact provenance. Actual native
+tool output requires qualification on the pinned runtime.
 
 The [throwaway prototype](https://github.com/Reid-Surmeier/tend/blob/510e4b71ad743b85411d277b991a3b36bfd1a8a2/generator/prototype-lifecycle-203.html)
 is archived outside production. Its six browser walkthroughs and eight targeted
