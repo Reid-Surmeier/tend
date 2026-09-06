@@ -15,7 +15,9 @@
    the subscription `auth.json` path is incompatible with tend's concurrent
    workflows and is not exposed. #}
 {% macro agent_step(cfg, prompt_body, if_condition='') %}
-{% if cfg.harness == 'claude' %}
+{% if cfg.action_source %}
+      - uses: <<cfg.action_source.replace('@', '/' ~ cfg.harness ~ '@')>>
+{% elif cfg.harness == 'claude' %}
       - uses: max-sixty/tend/claude@<<tend_version>>
 {% else %}
       - uses: max-sixty/tend/codex@<<tend_version>>

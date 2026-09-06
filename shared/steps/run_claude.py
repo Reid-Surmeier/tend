@@ -31,15 +31,18 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
+import re
 import signal
 import subprocess
+import threading
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Any
+from typing import Any, BinaryIO
 
 import _common
 import _sandbox
@@ -102,6 +105,7 @@ def launch_argv(
     bot_id: str,
     ci: str,
     settings_file: str = "",
+    metadata_only: bool = False,
 ) -> list[str]:
     """The command that launches the agent as the non-sudo sandbox user.
 
@@ -151,6 +155,8 @@ def launch_argv(
     ]
     if settings_file:
         argv.extend(["--settings", settings_file])
+    if metadata_only:
+        argv.append("--no-session-persistence")
     argv.append(prompt)
     return argv
 
@@ -217,6 +223,334 @@ def signal_sandbox(name: str, sandbox: str) -> None:
     )
 
 
+def _review_declaration(
+    review: Any, *, review_source_only: bool = False
+) -> dict[str, Any] | None:
+    """Explanations are permitted only for a trusted source-only caller."""
+    if len(json.dumps(review, allow_nan=False).encode()) > (
+        12288 if review_source_only else 1024
+    ):
+        return None
+    if (
+        not isinstance(review, dict)
+        or set(review)
+        != {"axis", "candidate", "fixed_point", "verdict", "complete", "findings"}
+        or not all(
+            isinstance(review[key], str)
+            for key in ("axis", "candidate", "fixed_point", "verdict")
+        )
+        or review["axis"] not in {"standards", "spec", "ponytail"}
+        or review["verdict"] not in {"ship", "revise"}
+        or any(
+            not re.fullmatch(r"[0-9a-f]{40}", review[key])
+            for key in ("candidate", "fixed_point")
+        )
+    ):
+        return None
+    findings = review["findings"]
+    if (
+        type(review["complete"]) is not bool
+        or not isinstance(findings, list)
+        or len(findings) > 8
+        or any(
+            not isinstance(item, dict)
+            or set(item)
+            != (
+                {"file", "line", "kind", "explanation", "change"}
+                if review_source_only
+                else {"file", "line", "kind"}
+            )
+            or (
+                review_source_only
+                and any(
+                    not isinstance(item[key], str)
+                    or not item[key].strip()
+                    or not item[key].isprintable()
+                    or len(item[key]) > 600
+                    for key in ("explanation", "change")
+                )
+            )
+            or type(item["file"]) is not int
+            or not 0 <= item["file"] < 1_000_000
+            or type(item["line"]) is not int
+            or not 0 <= item["line"] <= 10_000_000
+            or not isinstance(item["kind"], str)
+            or item["kind"] not in {"correctness", "security", "spec", "simplification"}
+            for item in findings
+        )
+    ):
+        return None
+    if len({(item["file"], item["line"], item["kind"]) for item in findings}) != len(
+        findings
+    ) or (review["verdict"] == "ship") != (review["complete"] and not findings):
+        return None
+    return review
+
+
+def capture_metadata(
+    source: BinaryIO,
+    target: BinaryIO,
+    *,
+    probe: str = "",
+    review_source_only: bool = False,
+) -> None:
+    """Allowlist native events and opted-in source-only findings before writing.
+
+    A malformed or oversized record makes the entire capture unsuccessful.
+    # ponytail: 4 MiB per record; increase only for a measured legitimate event.
+    """
+    limit = 4 * 1024 * 1024
+    failed = False
+    native_launches: dict[str, tuple[str, str | None]] = {}
+    native_completions: set[str] = set()
+    submission_launches: dict[
+        str, tuple[tuple[str, str | None], dict[str, Any] | None]
+    ] = {}
+    returned_tools: set[str] = set()
+    submitted_reviews: dict[str, dict[str, Any] | None] = {}
+    review_tool = "mcp__tend_review__submit_review"
+    tool_id = re.compile(r"toolu_[A-Za-z0-9]{10,64}\Z")
+    session_id = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+    try:
+        while line := source.readline(limit + 1):
+            if len(line) > limit:
+                failed = True
+                while line and not line.endswith(b"\n"):
+                    line = source.readline(limit + 1)
+                continue
+            try:
+                event = json.loads(
+                    line,
+                    object_pairs_hook=lambda pairs: (
+                        dict(pairs) if len(dict(pairs)) == len(pairs) else None
+                    ),
+                )
+                if not isinstance(event, dict):
+                    raise TypeError
+                kind = event.get("type")
+                record: dict[str, Any] = {"type": kind}
+                if kind == "result":
+                    success = (
+                        event.get("subtype") == "success"
+                        and event.get("is_error") is False
+                    )
+                    failed |= not success
+                    record.update(
+                        subtype="success" if success else "error", is_error=not success
+                    )
+                    if probe:
+                        answer = event.get("result")
+                        record["probe_seen"] = (
+                            isinstance(answer, str) and probe in answer
+                        )
+                    for key in ("num_turns", "total_cost_usd"):
+                        value = event.get(key)
+                        if (
+                            type(value) in (int, float)
+                            and math.isfinite(value)
+                            and 0 <= value <= 10**15
+                        ):
+                            record[key] = value
+                    usage = event.get("usage")
+                    record["usage"] = {
+                        key: value
+                        for key, value in (
+                            usage.items() if isinstance(usage, dict) else ()
+                        )
+                        if key
+                        in {
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_creation_input_tokens",
+                            "cache_read_input_tokens",
+                        }
+                        and type(value) is int
+                        and 0 <= value <= 10**15
+                    }
+                elif kind in ("assistant", "user"):
+                    message = event.get("message")
+                    if not isinstance(message, dict):
+                        raise TypeError
+                    blocks = message.get("content")
+                    if kind == "user" and isinstance(blocks, str):
+                        continue
+                    if not isinstance(blocks, list):
+                        raise TypeError
+                    kept = []
+                    for block in blocks:
+                        if not isinstance(block, dict):
+                            raise TypeError
+                        if (
+                            kind == "assistant"
+                            and block.get("type") == "tool_use"
+                            and block.get("name") in ("Agent", "Task", review_tool)
+                        ):
+                            value = block.get("id")
+                            if not isinstance(value, str) or not tool_id.fullmatch(
+                                value
+                            ):
+                                raise ValueError
+                            kept.append(
+                                {"type": "tool_use", "name": block["name"], "id": value}
+                            )
+                            if block["name"] == review_tool:
+                                review = _review_declaration(
+                                    block.get("input"),
+                                    review_source_only=review_source_only,
+                                )
+                                if review is not None:
+                                    kept[-1]["review"] = review
+                        elif kind == "user" and block.get("type") == "tool_result":
+                            value = block.get("tool_use_id")
+                            if (
+                                not isinstance(value, str)
+                                or not tool_id.fullmatch(value)
+                                or type(block.get("is_error", False)) is not bool
+                            ):
+                                raise ValueError
+                            kept.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": value,
+                                    "is_error": block.get("is_error", False),
+                                }
+                            )
+                            if probe:
+                                content = block.get("content")
+                                texts = (
+                                    [content]
+                                    if isinstance(content, str)
+                                    else [
+                                        part.get("text")
+                                        for part in (
+                                            content if isinstance(content, list) else []
+                                        )
+                                        if isinstance(part, dict)
+                                        and part.get("type") == "text"
+                                    ]
+                                )
+                                kept[-1]["probe_seen"] = any(
+                                    isinstance(text, str) and probe in text
+                                    for text in texts
+                                )
+                                kept[-1]["probe_text_bytes"] = (
+                                    sum(
+                                        len(text.encode())
+                                        for text in texts
+                                        if isinstance(text, str)
+                                    )
+                                    if kept[-1]["probe_seen"]
+                                    else 0
+                                )
+                    if not kept:
+                        continue
+                    record["message"] = {"content": kept}
+                    if "parent_tool_use_id" in event:
+                        parent = event["parent_tool_use_id"]
+                        if parent is not None and (
+                            not isinstance(parent, str) or not tool_id.fullmatch(parent)
+                        ):
+                            raise ValueError
+                        record["parent_tool_use_id"] = parent
+                else:
+                    continue
+                value = event.get("session_id")
+                if isinstance(value, str) and session_id.fullmatch(value):
+                    record["session_id"] = value
+                has_lineage = "session_id" in record and "parent_tool_use_id" in record
+                if (
+                    kind == "assistant"
+                    and not has_lineage
+                    and any(block["name"] == review_tool for block in kept)
+                ):
+                    raise ValueError
+                if kind == "user":
+                    for block in kept:
+                        returned = block["tool_use_id"]
+                        if returned in submission_launches and (
+                            not has_lineage
+                            or len(kept) != 1
+                            or returned in returned_tools
+                        ):
+                            raise ValueError
+                        returned_tools.add(returned)
+                if kind in ("assistant", "user") and has_lineage:
+                    lineage = (record["session_id"], record["parent_tool_use_id"])
+                    if kind == "assistant":
+                        for block in kept:
+                            if (
+                                block["id"] in native_launches
+                                or block["id"] in submission_launches
+                            ):
+                                raise ValueError
+                            if block["name"] == review_tool:
+                                if (
+                                    block["id"] in returned_tools
+                                    or native_launches.get(lineage[1])
+                                    != (lineage[0], None)
+                                    or lineage[1] in native_completions
+                                ):
+                                    raise ValueError
+                                submission_launches[block["id"]] = (
+                                    lineage,
+                                    block.get("review"),
+                                )
+                            else:
+                                native_launches[block["id"]] = lineage
+                    elif (
+                        len(kept) == 1 and kept[0]["tool_use_id"] in submission_launches
+                    ):
+                        submission = kept[0]["tool_use_id"]
+                        expected, review = submission_launches[submission]
+                        if lineage != expected or lineage[1] in native_completions:
+                            raise ValueError
+                        if not kept[0]["is_error"]:
+                            if lineage[1] in submitted_reviews:
+                                raise ValueError
+                            submitted_reviews[lineage[1]] = review
+                            if review is not None:
+                                kept[0]["review_submission"] = review
+                    elif (
+                        len(kept) == 1
+                        and native_launches.get(kept[0]["tool_use_id"]) == lineage
+                    ):
+                        if kept[0]["tool_use_id"] in native_completions:
+                            raise ValueError
+                        native = event.get("tool_use_result")
+                        if (
+                            isinstance(native, dict)
+                            and native.get("status") == "completed"
+                            and not kept[0]["is_error"]
+                        ):
+                            agent = native.get("agentId")
+                            if not isinstance(agent, str) or not re.fullmatch(
+                                r"a[0-9a-f]{16}", agent
+                            ):
+                                raise ValueError
+                            kept[0]["native_agent"] = {
+                                "id": agent,
+                                "status": "completed",
+                            }
+                            review = submitted_reviews.get(kept[0]["tool_use_id"])
+                            kept[0]["review_parse"] = (
+                                "accepted"
+                                if review is not None
+                                else "missing-submission"
+                            )
+                            if review is not None:
+                                kept[0]["native_agent"]["review"] = review
+                            native_completions.add(kept[0]["tool_use_id"])
+                encoded = json.dumps(record, allow_nan=False).encode()
+                if probe and probe.encode() in encoded:
+                    raise ValueError
+                target.write(encoded + b"\n")
+            except (ValueError, TypeError, OverflowError, RecursionError):
+                failed = True
+    finally:
+        if failed:
+            target.write(b'{"type":"result","subtype":"error","is_error":true}\n')
+
+
 def supervise(
     argv: list[str],
     *,
@@ -224,6 +558,9 @@ def supervise(
     timeout_sec: int,
     stream_json: Path,
     stderr_log: Path,
+    metadata_only: bool = False,
+    probe: str = "",
+    review_source_only: bool = False,
 ) -> Supervised:
     """Run *argv* under the bound, capturing its streams to runner-owned files.
 
@@ -255,15 +592,38 @@ def supervise(
     """
     start = time.monotonic()
     agent: subprocess.Popen[bytes] | None = None
+    capture: threading.Thread | None = None
+    captured = []
     try:
         with (
             raise_on_cancel(),
             stream_json.open("wb") as out,
-            stderr_log.open("wb") as err,
+            open(os.devnull, "wb") if metadata_only else stderr_log.open("wb") as err,
         ):
             agent = subprocess.Popen(
-                argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE if metadata_only else out,
+                stderr=err,
             )
+            if metadata_only:
+                assert agent.stdout is not None
+
+                def collect() -> None:
+                    try:
+                        capture_metadata(
+                            agent.stdout,
+                            out,
+                            probe=probe,
+                            review_source_only=review_source_only,
+                        )
+                    except OSError:
+                        # Never quote a capture exception that may contain input.
+                        return
+                    captured.append(True)
+
+                capture = threading.Thread(target=collect)
+                capture.start()
             try:
                 returncode = agent.wait(timeout_sec)
                 # Shell convention: 128 + N when signal N killed the child.
@@ -277,6 +637,15 @@ def supervise(
                 # `sudo` exits once its child does, so this observes the agent.
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     agent.wait(TERM_GRACE_SEC)
+            finally:
+                # Reap before joining so no surviving child can hold the pipe open.
+                if capture is not None:
+                    signal_sandbox("KILL", sandbox)
+                    agent.wait()
+                    capture.join()
+                    agent.stdout.close()
+                    if not captured:
+                        raise RuntimeError("Runtime metadata capture failed")
     finally:
         signal_sandbox("KILL", sandbox)
         if agent is not None:
@@ -419,12 +788,13 @@ def verdict(
     stderr_log: Path,
     timeout_sec: str,
     show_full_output: str,
+    metadata_only: bool = False,
 ) -> int:
     """The step's exit code, with the annotation and job summary that explain it.
 
     ``claude_exit`` is None exactly when the bound killed the run.
     """
-    if show_full_output == "true":
+    if show_full_output == "true" and not metadata_only:
         lines = transcript(stream_events(stream_json), TRANSCRIPT_MAX_LINES)
         if lines:
             _common.append_summary(
@@ -435,25 +805,37 @@ def verdict(
         return _common.fail(f"Claude headless run exceeded {timeout_sec}s timeout")
 
     if claude_exit:
-        reason = failure_reason(stream_events(stream_json))
+        reason = "" if metadata_only else failure_reason(stream_events(stream_json))
         named = f": {reason}" if reason else ""
+        artifact = "runtime metadata" if metadata_only else "session-logs artifact"
         _common.annotate(
             "error",
             f"claude -p exited non-zero (exit={claude_exit}){named}"
-            " — see the session-logs artifact",
+            f" — see the {artifact}",
         )
-        _quote_stderr(stderr_log)
+        if not metadata_only:
+            _quote_stderr(stderr_log)
         return claude_exit
 
     why = turn_outcome(stream_events(stream_json))
     if why is None:
         return 0
     _common.annotate("error", f"claude -p {why}")
-    _quote_stderr(stderr_log)
+    if not metadata_only:
+        _quote_stderr(stderr_log)
     return 1
 
 
 def main() -> int:
+    mode = os.environ.get("TEND_METADATA_ONLY", "false")
+    if mode not in ("true", "false"):
+        raise SystemExit("TEND_METADATA_ONLY must be true or false")
+    metadata_only = mode == "true"
+    review_mode = os.environ.get("TEND_REVIEW_SOURCE_ONLY", "false")
+    if review_mode not in ("true", "false") or (
+        review_mode == "true" and not metadata_only
+    ):
+        raise SystemExit("Invalid source-only review configuration")
     env = _common.require_env(
         "SANDBOX",
         "AGENT_ENV_FILE",
@@ -472,6 +854,23 @@ def main() -> int:
     )
     sandbox = env["SANDBOX"]
     workspace = Path(env["GITHUB_WORKSPACE"])
+    probe = ""
+    if probe_file := os.environ.get("TEND_METADATA_PROBE_FILE", ""):
+        try:
+            path = (workspace / probe_file).resolve()
+            if (
+                not metadata_only
+                or not path.is_relative_to(workspace.resolve())
+                or not path.is_file()
+            ):
+                raise ValueError
+            with path.open("rb") as source:
+                raw = source.read(66)
+            if not re.fullmatch(rb"[0-9a-f]{64}\n?", raw):
+                raise ValueError
+            probe = raw.decode("ascii").strip()
+        except (OSError, ValueError, RuntimeError):
+            raise SystemExit("Invalid synthetic metadata probe configuration") from None
     stream_json = Path(env["RUNNER_TEMP"]) / "tend-stream.json"
     stderr_log = Path(env["RUNNER_TEMP"]) / "tend-claude-stderr.log"
 
@@ -513,6 +912,7 @@ def main() -> int:
         bot_id=env["BOT_ID"],
         ci=os.environ.get("CI") or "true",
         settings_file=os.environ.get("TEND_AUTO_MEMORY_SETTINGS", ""),
+        metadata_only=metadata_only,
     )
     # Published before the launch: the path does not depend on the run, and the
     # steps that read it — Token usage, the session-logs artifact — are
@@ -526,6 +926,9 @@ def main() -> int:
             timeout_sec=int(env["TEND_TIMEOUT_SEC"]),
             stream_json=stream_json,
             stderr_log=stderr_log,
+            metadata_only=metadata_only,
+            probe=probe,
+            review_source_only=review_mode == "true",
         )
     finally:
         # supervise() kills and reaps the sandbox uid on every exit, including
@@ -546,6 +949,7 @@ def main() -> int:
         stderr_log=stderr_log,
         timeout_sec=env["TEND_TIMEOUT_SEC"],
         show_full_output=env["SHOW_FULL_OUTPUT"],
+        metadata_only=metadata_only,
     )
 
 

@@ -53,6 +53,25 @@ inputs:
   show_full_output:
     default: "false"
     description: Include the rendered Claude transcript in the workflow step summary.
+  metadata_only:
+    default: "false"
+    description: >-
+      Keep only structural native events and numeric usage in Tend diagnostics.
+      Disables native session persistence, stderr capture, transcript/skill summaries
+      and session-log uploads. Cannot be combined with memory_gist.
+  metadata_probe_file:
+    default: ""
+    description: >-
+      Qualification only: workspace file containing a synthetic 64-character
+      lowercase hex canary. Requires metadata_only. Capture records only whether
+      return/final text contained it; never use real private data or credentials.
+  review_source_only:
+    default: "false"
+    description: >-
+      Retain bounded explanation and change fields in typed review findings.
+      Requires metadata_only and disabled memory_gist. The trusted caller must
+      supply repository/review inputs only: no private memory service or copied
+      home configuration. Raw transcripts and tool results remain suppressed.
   claude_version:
     default: "2.1.251"
     description: >-
@@ -145,6 +164,28 @@ runs:
     # `usercustomize.py` or `.pth` under the runner's `~/.local` cannot run
     # first. Not `-I`, which implies `-P`: that removes the script's own
     # directory from `sys.path` and breaks `import _common`.
+    - name: Validate diagnostic mode
+      shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+      env:
+        BASH_ENV: ""
+        TEND_METADATA_ONLY: ${{ inputs.metadata_only }}
+        TEND_MEMORY_GIST: ${{ inputs.memory_gist }}
+        TEND_REVIEW_SOURCE_ONLY: ${{ inputs.review_source_only }}
+        TEND_METADATA_PROBE_FILE: ${{ inputs.metadata_probe_file }}
+      run: |
+        case "$TEND_METADATA_ONLY" in
+          false) ;;
+          true) test "$TEND_MEMORY_GIST" = false || { echo 'metadata_only cannot use memory_gist' >&2; exit 1; } ;;
+          *) echo 'metadata_only must be true or false' >&2; exit 1 ;;
+        esac
+        case "$TEND_REVIEW_SOURCE_ONLY" in
+          false) ;;
+          true) test "$TEND_METADATA_ONLY" = true || { echo 'source-only review requires metadata_only' >&2; exit 1; } ;;
+          *) echo 'review_source_only must be true or false' >&2; exit 1 ;;
+        esac
+        if test -n "$TEND_METADATA_PROBE_FILE"; then
+          test "$TEND_METADATA_ONLY" = true || { echo 'metadata probe requires metadata_only' >&2; exit 1; }
+        fi
     - name: Security preflight
       id: security
       shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
@@ -313,7 +354,7 @@ runs:
     # shared memory.
     - name: Restore experimental memory Gist
       id: auto_memory
-      if: inputs.memory_gist == 'true'
+      if: inputs.memory_gist == 'true' && inputs.metadata_only == 'false'
       continue-on-error: true
       shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
       run: |
@@ -392,6 +433,9 @@ runs:
         TEND_PROMPT: ${{ inputs.prompt }}
         TEND_TIMEOUT_SEC: ${{ inputs.timeout_seconds }}
         SHOW_FULL_OUTPUT: ${{ inputs.show_full_output }}
+        TEND_REVIEW_SOURCE_ONLY: ${{ inputs.review_source_only }}
+        TEND_METADATA_ONLY: ${{ inputs.metadata_only }}
+        TEND_METADATA_PROBE_FILE: ${{ inputs.metadata_probe_file }}
       run: /usr/bin/python3 -E -s "${{ github.action_path }}/../shared/steps/run_claude.py"
 
     # run_claude.py reaps every sandbox process before returning, so this
@@ -451,7 +495,7 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github_token }}
 
     - name: Append skill step summary
-      if: always()
+      if: always() && inputs.metadata_only == 'false'
       shell: bash
       run: |
         if [ -f /tmp/claude/step-summary.md ]; then
@@ -472,6 +516,7 @@ runs:
       env:
         MODEL: ${{ inputs.model }}
         STREAM_JSON: ${{ steps.claude.outputs.stream_json }}
+        TEND_METADATA_ONLY: ${{ inputs.metadata_only }}
       run: /usr/bin/python3 -E -s "${{ github.action_path }}/../shared/steps/token_usage.py" --harness claude
 
     # Gate on the job being red, not on the agent step specifically. A dozen
@@ -524,7 +569,7 @@ runs:
         echo "name=claude-session-logs${name_key}" >> "$GITHUB_OUTPUT"
 
     - name: Upload session logs
-      if: always()
+      if: always() && inputs.metadata_only == 'false'
       uses: actions/upload-artifact@v7
       with:
         name: ${{ steps.artifact.outputs.name }}
@@ -532,5 +577,13 @@ runs:
         # token-usage.json, the stderr log, and (on tend's own repo) the raw
         # stream-json into this runner-owned dir.
         path: ${{ runner.temp }}/tend-logs/
+        retention-days: 30
+        if-no-files-found: warn
+    - name: Upload runtime metadata
+      if: always() && inputs.metadata_only == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ steps.artifact.outputs.name }}-metadata
+        path: ${{ runner.temp }}/tend-metadata/
         retention-days: 30
         if-no-files-found: warn

@@ -54,6 +54,90 @@ def test_claude_transcript_summary_is_opt_in() -> None:
     assert action["inputs"]["show_full_output"]["default"] == "false"
 
 
+def test_metadata_mode_gates_every_agent_content_publisher() -> None:
+    action = YAML(typ="safe", pure=True).load(
+        (REPO_ROOT / "claude/action.yaml").read_text()
+    )
+    steps = {step["name"]: step for step in action["runs"]["steps"]}
+    assert action["inputs"]["metadata_only"]["default"] == "false"
+    for name in (
+        "Append skill step summary",
+        "Upload session logs",
+        "Restore experimental memory Gist",
+    ):
+        assert "inputs.metadata_only == 'false'" in steps[name]["if"]
+    for name in ("Run Claude", "Token usage"):
+        assert steps[name]["env"]["TEND_METADATA_ONLY"] == "${{ inputs.metadata_only }}"
+    assert (
+        steps["Upload runtime metadata"]["with"]["path"]
+        == "${{ runner.temp }}/tend-metadata/"
+    )
+    assert (
+        steps["Upload runtime metadata"]["if"]
+        == "always() && inputs.metadata_only == 'true'"
+    )
+
+
+def test_metadata_probe_is_opt_in_and_reaches_only_the_trusted_supervisor() -> None:
+    action = YAML(typ="safe", pure=True).load(
+        (REPO_ROOT / "claude/action.yaml").read_text()
+    )
+    assert action["inputs"]["metadata_probe_file"]["default"] == ""
+    recipients = {
+        step["name"]
+        for step in action["runs"]["steps"]
+        if "TEND_METADATA_PROBE_FILE" in step.get("env", {})
+    }
+    assert recipients == {"Validate diagnostic mode", "Run Claude"}
+    for step in action["runs"]["steps"]:
+        if step["name"] in recipients:
+            assert (
+                step["env"]["TEND_METADATA_PROBE_FILE"]
+                == "${{ inputs.metadata_probe_file }}"
+            )
+
+
+def test_source_only_review_requires_content_suppression_and_no_gist() -> None:
+    action = YAML(typ="safe", pure=True).load(
+        (REPO_ROOT / "claude/action.yaml").read_text()
+    )
+    assert action["inputs"]["review_source_only"]["default"] == "false"
+    steps = {step["name"]: step for step in action["runs"]["steps"]}
+    for name in ("Validate diagnostic mode", "Run Claude"):
+        assert (
+            steps[name]["env"]["TEND_REVIEW_SOURCE_ONLY"]
+            == "${{ inputs.review_source_only }}"
+        )
+    for source, metadata, gist, accepted in (
+        ("true", "true", "false", True),
+        ("false", "false", "false", True),
+        ("true", "false", "false", False),
+        ("true", "true", "true", False),
+        ("TRUE", "true", "false", False),
+        ("", "true", "false", False),
+    ):
+        result = subprocess.run(
+            [
+                "bash",
+                "-euo",
+                "pipefail",
+                "-c",
+                steps["Validate diagnostic mode"]["run"],
+            ],
+            env={
+                "PATH": "/usr/bin:/bin",
+                "TEND_REVIEW_SOURCE_ONLY": source,
+                "TEND_METADATA_ONLY": metadata,
+                "TEND_MEMORY_GIST": gist,
+                "TEND_METADATA_PROBE_FILE": "",
+            },
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert (result.returncode == 0) == accepted
+
+
 def test_experimental_memory_gist_sync_cannot_replace_the_agent_verdict() -> None:
     action = YAML(typ="safe", pure=True).load(
         (REPO_ROOT / "claude" / "action.yaml").read_text()

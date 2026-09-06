@@ -79,6 +79,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
@@ -111,9 +112,8 @@ CODEX_TABLE = (
 )
 
 PARTIAL_NOTE = (
-    "*Reconstructed from the session log: this run emitted no result event "
-    "(most often a cancellation), so the token counts are its own but the cost "
-    "is not recoverable.*"
+    "*Incomplete usage: retained counts may be lower bounds, not actual totals. "
+    "The final cost is unavailable; this is not a free run.*"
 )
 LIST_PRICE_NOTE = (
     "*Cost at API list prices — a large multiple of the effective rate on "
@@ -171,6 +171,22 @@ def run_context() -> dict[str, Any]:
 def claude_step(model: str) -> tuple[dict[str, Any], Path]:
     """Consolidate the sandbox's logs, then account the run from them."""
     runner_temp = Path(_common.require_env("RUNNER_TEMP")["RUNNER_TEMP"])
+    if os.environ.get("TEND_METADATA_ONLY") == "true":
+        logs_dir = runner_temp / "tend-metadata"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        stream_name = os.environ.get("STREAM_JSON", "")
+        stream = Path(stream_name) if stream_name else None
+        usage = claude_usage(stream=stream, logs_dir=logs_dir, model=model)
+        if stream is not None and stream.is_file():
+            shutil.copyfile(stream, logs_dir / "native-events.json")
+            results = [
+                event
+                for event in _common.read_ndjson(stream)
+                if event.get("type") == "result"
+            ]
+            if not results or "total_cost_usd" not in results[-1]:
+                usage.update(partial=True, cost_usd=None)
+        return usage, logs_dir
     logs_dir = runner_temp / "tend-logs"
     consolidate_logs(logs_dir, runner_temp)
 

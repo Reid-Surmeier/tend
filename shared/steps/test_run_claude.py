@@ -11,11 +11,13 @@ is a file or a scalar — so each branch is reachable from a fixture.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import signal
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,7 +52,626 @@ def _ev_result(subtype: str = "success", *, is_error: bool = False) -> str:
 
 # --- the verdict --------------------------------------------------------------
 
+
+@pytest.mark.parametrize("verdict", [None, "ship", "revise"])
+def test_metadata_observes_completed_native_identity_not_decorated_text(
+    verdict: str | None,
+) -> None:
+    tool = "toolu_0123456789abcdefghijklm"
+    session = "00000000-0000-4000-8000-000000000001"
+    common = {"session_id": session, "parent_tool_use_id": None}
+    review = {
+        "axis": "standards",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": verdict,
+        "complete": verdict != "revise",
+        "findings": [],
+    }
+    events = [
+        {
+            **common,
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Agent", "id": tool}]},
+        },
+        {
+            **common,
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool,
+                        "content": "PRIVATE text",
+                    }
+                ]
+            },
+            "tool_use_result": {
+                "status": "completed",
+                "agentId": "a0123456789abcdef",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(review) if verdict else "PRIVATE report",
+                    }
+                ],
+                "prompt": "PRIVATE prompt",
+            },
+        },
+        {**common, "type": "result", "subtype": "success", "is_error": False},
+    ]
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()), output
+    )
+    records = list(map(json.loads, output.getvalue().splitlines()))
+    expected = {"id": "a0123456789abcdef", "status": "completed"}
+    assert records[1]["message"]["content"][0]["native_agent"] == expected
+    assert records[1]["message"]["content"][0]["review_parse"] == "missing-submission"
+    assert b"PRIVATE" not in output.getvalue()
+    assert run_claude.turn_outcome(records) is None
+
+
 Verdict = Callable[..., tuple[int, str, str]]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "ship",
+        "failed-then-success",
+        "root",
+        "unknown-parent",
+        "nested",
+        "wrong-session",
+        "return-session",
+        "return-parent",
+        "missing-session",
+        "missing-parent",
+        "wrong-tool",
+        "missing-return",
+        "failed-return",
+        "duplicate-return",
+        "duplicate-submission",
+        "duplicate-launch",
+        "unknown-return",
+        "mixed-return",
+        "mixed-return-replay",
+        "missing-parent-return-replay",
+        "missing-session-return-replay",
+        "missing-session-launch-replay",
+        "return-before-launch",
+        "invalid-success-then-success",
+        "late-submission",
+        "unfinished",
+        "failed-native",
+        "forged-result",
+        "final-only",
+    ],
+)
+@pytest.mark.parametrize("source_only", [False, True])
+def test_metadata_binds_one_successful_submission_to_the_completed_child(
+    case: str,
+    source_only: bool,
+) -> None:
+    agent_call = "toolu_agent0123456789abcdef"
+    submit_call = "toolu_submit0123456789abcdef"
+    common = {
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "parent_tool_use_id": None,
+    }
+    child = {**common, "parent_tool_use_id": agent_call}
+    review = {
+        "axis": "spec",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": "ship",
+        "complete": True,
+        "findings": [],
+    }
+    if source_only:
+        review.update(
+            verdict="revise",
+            findings=[
+                {
+                    "file": 0,
+                    "line": 1,
+                    "kind": "correctness",
+                    "explanation": "The empty list reaches index zero.",
+                    "change": "Reject an empty list before indexing.",
+                }
+            ],
+        )
+    launch = {
+        **common,
+        "type": "assistant",
+        "message": {
+            "content": [{"type": "tool_use", "name": "Agent", "id": agent_call}]
+        },
+    }
+    submit = {
+        **child,
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "mcp__tend_review__submit_review",
+                    "id": submit_call,
+                    "input": review,
+                }
+            ]
+        },
+    }
+    returned = {
+        **child,
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": submit_call,
+                    "is_error": False,
+                    "content": "PRIVATE response",
+                }
+            ]
+        },
+    }
+    completed = {
+        **common,
+        "type": "user",
+        "message": {
+            "content": [
+                {"type": "tool_result", "tool_use_id": agent_call, "is_error": False}
+            ]
+        },
+        "tool_use_result": {
+            "agentId": "a0123456789abcdef",
+            "status": "completed",
+            "content": [{"type": "text", "text": "PRIVATE narrative" * 1024}],
+        },
+    }
+    events = [launch, submit, returned, completed]
+    if case in ("root", "unknown-parent"):
+        submit["parent_tool_use_id"] = returned["parent_tool_use_id"] = (
+            None if case == "root" else "toolu_unknown0123456789abcdef"
+        )
+    elif case == "nested":
+        launch["parent_tool_use_id"] = "toolu_outer0123456789abcdef"
+    elif case in ("wrong-session", "return-session"):
+        (submit if case == "wrong-session" else returned)["session_id"] = (
+            "00000000-0000-4000-8000-000000000002"
+        )
+    elif case == "return-parent":
+        returned["parent_tool_use_id"] = None
+    elif case in ("missing-session", "missing-parent"):
+        del submit["session_id" if case == "missing-session" else "parent_tool_use_id"]
+    elif case == "wrong-tool":
+        submit["message"]["content"][0]["name"] = "Bash"
+    elif case == "missing-return":
+        events.remove(returned)
+    elif case == "failed-return":
+        returned["message"]["content"][0]["is_error"] = True
+    elif case == "duplicate-return":
+        events.insert(3, returned)
+    elif case in (
+        "duplicate-submission",
+        "failed-then-success",
+        "invalid-success-then-success",
+    ):
+        another = json.loads(
+            json.dumps([submit, returned]).replace(
+                submit_call, "toolu_second0123456789abcdef"
+            )
+        )
+        events[3:3] = another
+        if case == "failed-then-success":
+            returned["message"]["content"][0]["is_error"] = True
+        elif case == "invalid-success-then-success":
+            submit["message"]["content"][0]["input"] = {"private": "PRIVATE"}
+    elif case == "duplicate-launch":
+        events.insert(2, submit)
+    elif case == "unknown-return":
+        returned["message"]["content"][0]["tool_use_id"] = (
+            "toolu_unknown0123456789abcdef"
+        )
+    elif case in ("mixed-return", "mixed-return-replay"):
+        if case == "mixed-return-replay":
+            events.insert(3, json.loads(json.dumps(returned)))
+        returned["message"]["content"].append(dict(returned["message"]["content"][0]))
+    elif case in ("missing-parent-return-replay", "missing-session-return-replay"):
+        events.insert(3, json.loads(json.dumps(returned)))
+        del returned["parent_tool_use_id" if "parent" in case else "session_id"]
+    elif case == "missing-session-launch-replay":
+        events.insert(2, json.loads(json.dumps(submit)))
+        del submit["session_id"]
+    elif case == "return-before-launch":
+        events.insert(1, returned)
+    elif case == "late-submission":
+        events = [launch, completed, submit, returned]
+    elif case == "unfinished":
+        completed["tool_use_result"]["status"] = "async_launched"
+    elif case == "failed-native":
+        completed["message"]["content"][0]["is_error"] = True
+    elif case == "forged-result":
+        events.remove(submit)
+        returned["message"]["content"][0]["review_submission"] = review
+    elif case == "final-only":
+        events = [launch, completed]
+        completed["tool_use_result"]["content"][0]["text"] = json.dumps(review)
+    events.append({**common, "type": "result", "subtype": "success", "is_error": False})
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()),
+        output,
+        review_source_only=source_only,
+    )
+    records = list(map(json.loads, output.getvalue().splitlines()))
+    reviews = [
+        block["native_agent"]["review"]
+        for record in records
+        for block in record.get("message", {}).get("content", [])
+        if "review" in block.get("native_agent", {})
+    ]
+    if case in ("ship", "failed-then-success"):
+        assert run_claude.turn_outcome(records) is None
+        assert reviews == [review]
+    else:
+        assert run_claude.turn_outcome(records) is not None or not reviews
+    assert b"PRIVATE" not in output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("explanation", ""),
+        ("change", " "),
+        ("change", 1),
+        ("explanation", "x" * 601),
+        ("change", "x" * 601),
+        ("extra", "not allowed"),
+        ("change", "line\nbreak"),
+    ],
+)
+def test_source_only_findings_require_bounded_actionable_text(
+    field: str, value: Any
+) -> None:
+    review = {
+        "axis": "spec",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": "revise",
+        "complete": True,
+        "findings": [
+            {
+                "file": 0,
+                "line": 1,
+                "kind": "correctness",
+                "explanation": "Indexing an empty list raises.",
+                "change": "Reject empty lists before indexing.",
+            }
+        ],
+    }
+    assert run_claude._review_declaration(review) is None
+    assert run_claude._review_declaration(review, review_source_only=True) == review
+    review["findings"][0][field] = value
+    assert run_claude._review_declaration(review, review_source_only=True) is None
+
+
+@pytest.mark.parametrize(
+    "case,status",
+    [
+        ("finding", "accepted"),
+        ("incomplete", "accepted"),
+        ("eight", "accepted"),
+        ("missing", "content-shape"),
+        ("multiple", "content-shape"),
+        ("block-type", "content-shape"),
+        ("oversized", "oversized"),
+        ("json", "json"),
+        ("nan", "json"),
+        ("forged-status", "json"),
+        ("old-schema", "schema"),
+        ("duplicate-key", "schema"),
+        ("newline-sha", "schema"),
+        ("complete-number", "schema"),
+        ("findings-type", "schema"),
+        ("ship-finding", "schema"),
+        ("revise-empty", "schema"),
+        ("nine", "schema"),
+        ("duplicate-finding", "schema"),
+        ("file-bool", "schema"),
+        ("file-negative", "schema"),
+        ("file-high", "schema"),
+        ("line-bool", "schema"),
+        ("line-negative", "schema"),
+        ("line-high", "schema"),
+        ("kind-text", "schema"),
+        ("extra-text", "schema"),
+        ("item-string", "schema"),
+        ("no-kind", "schema"),
+    ],
+)
+def test_metadata_review_diagnostics_and_numeric_findings(
+    case: str, status: str
+) -> None:
+    review = {
+        "axis": "standards",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": "revise",
+        "complete": True,
+        "findings": [{"file": 0, "line": 1, "kind": "security"}],
+    }
+    if case == "incomplete":
+        review.update(complete=False, findings=[])
+    elif case in ("eight", "nine"):
+        review["findings"] = [
+            {"file": n, "line": 0, "kind": "correctness"}
+            for n in range(8 if case == "eight" else 9)
+        ]
+    elif case == "old-schema":
+        del review["complete"], review["findings"]
+    elif case == "newline-sha":
+        review["candidate"] += "\n"
+    elif case == "complete-number":
+        review["complete"] = 1
+    elif case == "findings-type":
+        review["findings"] = "PRIVATE findings"
+    elif case == "ship-finding":
+        review["verdict"] = "ship"
+    elif case == "revise-empty":
+        review["findings"] = []
+    elif case == "duplicate-finding":
+        review["findings"] *= 2
+    elif case in (
+        "file-bool",
+        "file-negative",
+        "file-high",
+        "line-bool",
+        "line-negative",
+        "line-high",
+    ):
+        field, variant = case.split("-")
+        review["findings"][0][field] = (
+            True
+            if variant == "bool"
+            else -1
+            if variant == "negative"
+            else (1000000 if field == "file" else 10000001)
+        )
+    elif case == "kind-text":
+        review["findings"][0]["kind"] = "PRIVATE reason"
+    elif case == "extra-text":
+        review["findings"][0]["message"] = "PRIVATE finding"
+    elif case == "item-string":
+        review["findings"] = ["PRIVATE finding"]
+    elif case == "no-kind":
+        del review["findings"][0]["kind"]
+    text = json.dumps(review)
+    if case in ("json", "forged-status"):
+        text = "PRIVATE non-JSON response"
+    elif case == "nan":
+        text = text.replace('"complete": true', '"complete": NaN')
+    elif case == "duplicate-key":
+        text = text.replace('"line": 1', '"line": 9, "line": 1')
+    elif case == "oversized":
+        text += " " * 1024
+    content = [{"type": "text", "text": text}]
+    if case == "missing":
+        content = None
+    elif case == "multiple":
+        content *= 2
+    elif case == "block-type":
+        content[0]["type"] = "image"
+    tool = "toolu_0123456789abcdefghijklm"
+    common = {
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "parent_tool_use_id": None,
+    }
+    events = [
+        {
+            **common,
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Agent", "id": tool}]},
+        },
+        {
+            **common,
+            "type": "user",
+            "review_parse": "accepted",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool,
+                        "content": "PRIVATE decorated text",
+                        "review_parse": "accepted",
+                    }
+                ]
+            },
+            "tool_use_result": {
+                "status": "completed",
+                "agentId": "a0123456789abcdef",
+                "content": content,
+            },
+        },
+        {**common, "type": "result", "subtype": "success", "is_error": False},
+    ]
+    submission = "toolu_submit0123456789abcdef"
+    arguments = review if status in ("accepted", "schema") else {"private": text}
+    child = {**common, "parent_tool_use_id": tool}
+    events[1:1] = [
+        {
+            **child,
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "mcp__tend_review__submit_review",
+                        "id": submission,
+                        "input": arguments,
+                    }
+                ]
+            },
+        },
+        {
+            **child,
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": submission,
+                        "is_error": False,
+                        "content": "PRIVATE tool response",
+                    }
+                ]
+            },
+        },
+    ]
+    stream = "\n".join(map(json.dumps, events))
+    if case == "duplicate-key":
+        stream = stream.replace('"line": 1', '"line": 9, "line": 1')
+    output = io.BytesIO()
+    run_claude.capture_metadata(io.BytesIO(stream.encode()), output)
+    records = list(map(json.loads, output.getvalue().splitlines()))
+    result = next(
+        block
+        for record in records
+        for block in record.get("message", {}).get("content", [])
+        if "native_agent" in block
+    )
+    assert result["review_parse"] == (
+        "accepted" if status == "accepted" else "missing-submission"
+    )
+    assert ("review" in result["native_agent"]) == (status == "accepted")
+    if status == "accepted":
+        assert result["native_agent"]["review"] == review
+    assert b"PRIVATE" not in output.getvalue()
+    assert run_claude.turn_outcome(records) is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unseen",
+        "non-native",
+        "wrong-tool",
+        "wrong-session",
+        "missing-session",
+        "wrong-parent",
+        "missing-parent",
+        "error",
+        "async",
+        "missing-structured",
+        "bad-agent",
+        "forged-field",
+        "wrong-axis",
+        "wrong-verdict",
+        "wrong-hash",
+        "wrong-type",
+        "extra-key",
+        "duplicate-key",
+        "nan",
+        "multiple-blocks",
+        "oversized",
+        "duplicate-launch",
+        "duplicate-completion",
+    ],
+)
+def test_metadata_refuses_unobserved_or_malformed_native_review(case: str) -> None:
+    tool = "toolu_0123456789abcdefghijklm"
+    common = {
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "parent_tool_use_id": None,
+    }
+    review = {
+        "axis": "spec",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": "ship",
+        "complete": True,
+        "findings": [],
+    }
+    launch = {
+        **common,
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "Agent", "id": tool}]},
+    }
+    result = {"type": "tool_result", "tool_use_id": tool, "content": json.dumps(review)}
+    native = {"status": "completed", "agentId": "a0123456789abcdef", "content": []}
+    event = {
+        **common,
+        "type": "user",
+        "message": {"content": [result]},
+        "tool_use_result": native,
+    }
+    if case == "non-native":
+        launch["message"]["content"][0]["name"] = "Bash"
+    elif case == "wrong-tool":
+        result["tool_use_id"] = "toolu_9876543210abcdefghijklm"
+    elif case == "wrong-session":
+        event["session_id"] = "00000000-0000-4000-8000-000000000002"
+    elif case == "missing-session":
+        del event["session_id"]
+    elif case == "wrong-parent":
+        event["parent_tool_use_id"] = "toolu_9876543210abcdefghijklm"
+    elif case == "missing-parent":
+        del event["parent_tool_use_id"]
+    elif case == "error":
+        result["is_error"] = True
+    elif case == "async":
+        native["status"] = "async_launched"
+    elif case in ("missing-structured", "forged-field"):
+        del event["tool_use_result"]
+        result["native_agent"] = {
+            "id": "a0123456789abcdef",
+            "status": "completed",
+            "review": review,
+        }
+    elif case == "bad-agent":
+        native["agentId"] = "PRIVATE identity"
+    elif case == "wrong-axis":
+        review["axis"] = "PRIVATE axis"
+    elif case == "wrong-verdict":
+        review["verdict"] = "approved"
+    elif case == "wrong-hash":
+        review["candidate"] = "main"
+    elif case == "wrong-type":
+        review["candidate"] = 1
+    elif case == "extra-key":
+        review["private"] = "PRIVATE context"
+    text = json.dumps(review)
+    if case == "duplicate-key":
+        text = text.replace('"axis": "spec"', '"axis":"PRIVATE axis","axis":"spec"')
+    elif case == "nan":
+        text = text.replace('"axis": "spec"', '"axis":NaN')
+    elif case == "oversized":
+        text += " " * 1024
+    native["content"] = [{"type": "text", "text": text}] * (
+        2 if case == "multiple-blocks" else 1
+    )
+    events = (
+        ([] if case == "unseen" else [launch])
+        + ([launch] if case == "duplicate-launch" else [])
+        + ([event] if case == "duplicate-completion" else [])
+        + [event, {**common, "type": "result", "subtype": "success", "is_error": False}]
+    )
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()), output
+    )
+    records = list(map(json.loads, output.getvalue().splitlines()))
+    assert b"PRIVATE" not in output.getvalue()
+    if case in ("bad-agent", "duplicate-launch", "duplicate-completion"):
+        assert run_claude.turn_outcome(records) is not None
+    else:
+        assert all(
+            "review" not in block.get("native_agent", {})
+            for record in records
+            for block in record.get("message", {}).get("content", [])
+        )
 
 
 @pytest.fixture
@@ -85,6 +706,302 @@ def verdict(
         return code, capsys.readouterr().out, github_files.summary.read_text()
 
     return go
+
+
+@pytest.mark.parametrize(
+    "parent",
+    [
+        None,
+        "toolu_0123456789abcdefghijklm",
+        "missing",
+        "bad",
+        4,
+        [],
+        "toolu_" + "a" * 64,
+    ],
+)
+def test_metadata_retains_only_valid_observed_parent_lineage(parent: Any) -> None:
+    event = {
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_0123456789abcdefghijklm",
+                    "is_error": False,
+                    "content": "synthetic only",
+                }
+            ]
+        },
+    }
+    if parent != "missing":
+        event["parent_tool_use_id"] = parent
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO((json.dumps(event) + "\n").encode()), output, probe="a" * 64
+    )
+    records = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert b"synthetic only" not in output.getvalue()
+    assert b"a" * 64 not in output.getvalue()
+    if parent in (None, "toolu_0123456789abcdefghijklm"):
+        assert records[0]["parent_tool_use_id"] == parent
+    elif parent == "missing":
+        assert "parent_tool_use_id" not in records[0]
+    else:
+        assert records == [{"type": "result", "subtype": "error", "is_error": True}]
+
+
+def test_metadata_capture_drops_content_and_keeps_native_events() -> None:
+    canary = "PRIVATE_CONTEXT_CANARY"
+    events = [
+        {
+            "type": "assistant",
+            "session_id": "00000000-0000-4000-8000-000000000001",
+            "message": {
+                "content": [
+                    {"type": "text", "text": canary},
+                    {
+                        "type": "tool_use",
+                        "name": "Agent",
+                        "id": "toolu_0123456789abcdefghijklm",
+                        "input": {"prompt": canary},
+                    },
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_0123456789abcdefghijklm",
+                        "content": canary,
+                    }
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": canary,
+            "num_turns": 2,
+            "total_cost_usd": 0.2,
+            "usage": {"input_tokens": 12, "output_tokens": 34, "private": canary},
+        },
+    ]
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()), output
+    )
+    assert canary.encode() not in output.getvalue()
+    captured = list(map(json.loads, output.getvalue().splitlines()))
+    assert captured[0]["message"]["content"][0]["name"] == "Agent"
+    assert (
+        captured[1]["message"]["content"][0]["tool_use_id"]
+        == "toolu_0123456789abcdefghijklm"
+    )
+    assert captured[-1]["usage"] == {"input_tokens": 12, "output_tokens": 34}
+    assert run_claude.turn_outcome(captured) is None
+
+
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("blocks", [False, True])
+def test_metadata_probe_observes_return_text_not_forged_flags(
+    present: bool,
+    blocks: bool,
+) -> None:
+    probe = "a" * 64
+    text = probe if present else "no synthetic context"
+    events = [
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "Agent",
+                        "id": "toolu_0123456789abcdefghijklm",
+                        "input": {"prompt": probe},
+                        "probe_seen": True,
+                    }
+                ]
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_0123456789abcdefghijklm",
+                        "content": [{"type": "text", "text": text}] if blocks else text,
+                        "probe_seen": True,
+                    }
+                ]
+            },
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": text,
+            "probe_seen": True,
+        },
+    ]
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO("\n".join(map(json.dumps, events)).encode()),
+        output,
+        probe=probe,
+    )
+    captured = list(map(json.loads, output.getvalue().splitlines()))
+    assert "probe_seen" not in captured[0]["message"]["content"][0]
+    assert captured[1]["message"]["content"][0]["probe_seen"] is present
+    assert captured[-1]["probe_seen"] is present
+    assert probe.encode() not in output.getvalue()
+
+
+def test_metadata_probe_cannot_qualify_an_interrupted_or_malformed_stream() -> None:
+    for payload in (b"", b"broken\n" + _ev_result().encode()):
+        output = io.BytesIO()
+        run_claude.capture_metadata(io.BytesIO(payload), output, probe="a" * 64)
+        captured = list(map(json.loads, output.getvalue().splitlines()))
+        assert not any(event.get("probe_seen") is True for event in captured)
+        assert run_claude.turn_outcome(captured) is not None
+
+
+@pytest.mark.parametrize("shape", ["string", "blocks", "absent", "disabled"])
+def test_metadata_probe_size_is_observed_utf8_text_not_a_supplied_count(
+    shape: str,
+) -> None:
+    probe = "a" * 64
+    text = "é" * 8192 + (probe if shape != "absent" else "")
+    content = (
+        [{"type": "text", "text": text}, {"type": "image", "text": probe}]
+        if shape == "blocks"
+        else text
+    )
+    event = {
+        "type": "user",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_0123456789abcdefghijklm",
+                    "content": content,
+                    "probe_text_bytes": 999999,
+                    "probe_seen": True,
+                }
+            ]
+        },
+    }
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO(json.dumps(event).encode()),
+        output,
+        probe="" if shape == "disabled" else probe,
+    )
+    record = json.loads(output.getvalue())["message"]["content"][0]
+    if shape == "disabled":
+        assert "probe_text_bytes" not in record
+    else:
+        assert record["probe_text_bytes"] == (
+            len(text.encode()) if shape != "absent" else 0
+        )
+    assert probe.encode() not in output.getvalue()
+
+
+def test_metadata_probe_in_a_structural_id_fails_without_retention() -> None:
+    probe = "a" * 64
+    event = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "Agent",
+                    "id": "toolu_" + probe,
+                }
+            ]
+        },
+    }
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO((json.dumps(event) + "\n" + _ev_result()).encode()),
+        output,
+        probe=probe,
+    )
+    assert probe.encode() not in output.getvalue()
+    assert (
+        run_claude.turn_outcome(map(json.loads, output.getvalue().splitlines()))
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"broken",
+        b"[]",
+        b"x" * (4 * 1024 * 1024 + 1),
+        b'{"type":"result","subtype":"PRIVATE_CONTEXT_CANARY"}',
+    ],
+    ids=["malformed", "wrong-shape", "oversized", "unknown-result"],
+)
+def test_metadata_capture_fails_closed_without_quoting_bad_records(
+    payload: bytes,
+) -> None:
+    output = io.BytesIO()
+    run_claude.capture_metadata(
+        io.BytesIO(payload + b"\n" + _ev_result().encode()), output
+    )
+    assert b"PRIVATE_CONTEXT_CANARY" not in output.getvalue()
+    assert (
+        run_claude.turn_outcome(map(json.loads, output.getvalue().splitlines()))
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "bad",
+        {"content": 123},
+        {"content": [{"type": "tool_use", "name": "Agent", "id": 123}]},
+    ],
+    ids=["message", "content", "native-id"],
+)
+def test_metadata_rejects_malformed_native_events_even_before_success(
+    message: object,
+) -> None:
+    output = io.BytesIO()
+    stream = json.dumps({"type": "assistant", "message": message}) + "\n" + _ev_result()
+    run_claude.capture_metadata(io.BytesIO(stream.encode()), output)
+    assert (
+        run_claude.turn_outcome(map(json.loads, output.getvalue().splitlines()))
+        is not None
+    )
+
+
+def test_metadata_supervisor_never_records_child_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(run_claude, "signal_sandbox", lambda *args: None)
+    stream, stderr = tmp_path / "stream", tmp_path / "stderr"
+    script = 'import sys; print(\'{"type":"result","subtype":"success","is_error":false,"result":"PRIVATE_CONTEXT_CANARY"}\'); print("PRIVATE_CONTEXT_CANARY", file=sys.stderr)'
+    result = run_claude.supervise(
+        [sys.executable, "-c", script],
+        sandbox="unused",
+        timeout_sec=3,
+        stream_json=stream,
+        stderr_log=stderr,
+        metadata_only=True,
+    )
+    assert result.exit_code == 0
+    assert b"PRIVATE_CONTEXT_CANARY" not in stream.read_bytes()
+    assert not stderr.exists() or stderr.read_bytes() == b""
 
 
 def test_verdict_reports_a_crash_that_left_no_assistant_text(verdict: Verdict) -> None:
@@ -497,9 +1414,13 @@ def launch(
             calls.append(Recorded(list(argv), kwargs))
             if launch_error is not None:
                 raise launch_error
-            kwargs["stdout"].write(stream.encode())
+            agent = FakeAgent(calls, returncode, timed_out, term_ends_it)
+            if kwargs["stdout"] == subprocess.PIPE:
+                agent.stdout = io.BytesIO(stream.encode())
+            else:
+                kwargs["stdout"].write(stream.encode())
             kwargs["stderr"].write(stderr_text.encode())
-            return FakeAgent(calls, returncode, timed_out, term_ends_it)
+            return agent
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
@@ -520,6 +1441,168 @@ def launch(
         )
 
     return go
+
+
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_metadata_launch_disables_persistence_and_all_text_diagnostics(
+    launch: Launcher, returncode: int
+) -> None:
+    result = launch(
+        stream=_ev_text("PRIVATE_CONTEXT_CANARY") + "\n" + _ev_result(),
+        stderr_text="PRIVATE_CONTEXT_CANARY",
+        returncode=returncode,
+        TEND_METADATA_ONLY="true",
+        SHOW_FULL_OUTPUT="true",
+    )
+    assert "--no-session-persistence" in result.command("claude").argv
+    assert (
+        "PRIVATE_CONTEXT_CANARY"
+        not in result.out + result.summary + result.stream_json.read_text()
+    )
+    assert result.code == returncode
+
+
+def test_metadata_timeout_is_not_success_and_keeps_no_text(launch: Launcher) -> None:
+    result = launch(
+        stream=_ev_text("PRIVATE_CONTEXT_CANARY"),
+        stderr_text="PRIVATE_CONTEXT_CANARY",
+        timed_out=True,
+        TEND_METADATA_ONLY="true",
+    )
+    assert result.code != 0 and "exceeded" in result.out
+    assert (
+        "PRIVATE_CONTEXT_CANARY"
+        not in result.out + result.summary + result.stream_json.read_text()
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,metadata", [("true", "false"), ("TRUE", "true"), ("", "true")]
+)
+def test_source_only_configuration_refuses_before_launch(
+    mode: str, metadata: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEND_REVIEW_SOURCE_ONLY", mode)
+    monkeypatch.setenv("TEND_METADATA_ONLY", metadata)
+    with pytest.raises(SystemExit, match="^Invalid source-only review configuration$"):
+        run_claude.main()
+
+
+def test_source_only_flag_reaches_the_supervisor(launch: Launcher) -> None:
+    common = {
+        "session_id": "00000000-0000-4000-8000-000000000001",
+        "parent_tool_use_id": None,
+    }
+    agent = "toolu_agent0123456789abcdef"
+    declaration = {
+        "axis": "spec",
+        "candidate": "a" * 40,
+        "fixed_point": "b" * 40,
+        "verdict": "revise",
+        "complete": True,
+        "findings": [
+            {
+                "file": 0,
+                "line": 1,
+                "kind": "correctness",
+                "explanation": "An empty list raises.",
+                "change": "Reject empty lists.",
+            }
+        ],
+    }
+    events = [
+        {
+            **common,
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "tool_use", "name": "Agent", "id": agent}]
+            },
+        },
+        {
+            **common,
+            "parent_tool_use_id": agent,
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "mcp__tend_review__submit_review",
+                        "id": "toolu_submit0123456789abcdef",
+                        "input": declaration,
+                    }
+                ]
+            },
+        },
+    ]
+    result = launch(
+        stream="\n".join(map(json.dumps, events)) + "\n" + _ev_result(),
+        TEND_METADATA_ONLY="true",
+        TEND_REVIEW_SOURCE_ONLY="true",
+    )
+    assert "Reject empty lists." in result.stream_json.read_text()
+    assert "Reject empty lists." not in result.out + result.summary
+
+
+def test_metadata_probe_file_reaches_the_supervisor(
+    launch: Launcher, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    probe = "a" * 64
+    (workspace / "probe").write_text(probe + "\n")
+    result = launch(
+        stream=json.dumps(
+            {"type": "result", "subtype": "success", "is_error": False, "result": probe}
+        ),
+        TEND_METADATA_ONLY="true",
+        TEND_METADATA_PROBE_FILE="probe",
+    )
+    assert json.loads(result.stream_json.read_text())["probe_seen"] is True
+    assert probe not in result.out + result.summary + result.stream_json.read_text()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["disabled", "missing", "empty", "oversized", "nonhex", "outside", "directory"],
+)
+def test_metadata_probe_refuses_bad_files_before_launch(
+    kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / "probe"
+    if kind == "outside":
+        path = tmp_path / "outside"
+    if kind == "directory":
+        path.mkdir()
+    elif kind != "missing":
+        path.write_text(
+            {"empty": "", "oversized": "a" * 1000, "nonhex": "private text"}.get(
+                kind, "a" * 64
+            )
+        )
+    monkeypatch.setenv("TEND_METADATA_ONLY", "false" if kind == "disabled" else "true")
+    monkeypatch.setenv("TEND_METADATA_PROBE_FILE", str(path))
+    monkeypatch.setattr(
+        run_claude._common,
+        "require_env",
+        lambda *args: {
+            "SANDBOX": "unused",
+            "GITHUB_WORKSPACE": str(workspace),
+            "RUNNER_TEMP": str(tmp_path),
+        },
+    )
+
+    def refuse_launch(*args: object, **kwargs: object) -> None:
+        pytest.fail("Invalid probe configuration reached a subprocess")
+
+    monkeypatch.setattr(subprocess, "run", refuse_launch)
+    with pytest.raises(
+        SystemExit, match="^Invalid synthetic metadata probe configuration$"
+    ):
+        run_claude.main()
 
 
 def test_launch_steers_the_agent_entirely_through_argv(launch: Launcher) -> None:
